@@ -7,7 +7,7 @@ import os
 
 import trimesh
 import numpy as np
-
+from GUI_Design import *
 
 def get_master_slicing_surface(print_model_path, substrate_path, padding=5):
     """
@@ -78,19 +78,39 @@ def get_master_slicing_surface(print_model_path, substrate_path, padding=5):
     return master_skin,print_model,substrate
 
 
-def get_layer_zero(print_model_path, substrate_path, dist_tol=0.5, opposing_threshold=-0.8):
+def get_layer_zero(print_model, substrate, dist_tol=0.5, opposing_threshold=-0.8,padding=0):
     """
     Extracts the contact skin using Relative Opposing Normals.
     Even if the substrate is completely vertical, it will find the contact skin.
     """
-    print("Loading explicit B-Rep meshes...")
-    print_model = trimesh.load_mesh(print_model_path)
-    substrate = trimesh.load_mesh(substrate_path)
+    #print("Loading explicit B-Rep meshes...")
+    #print_model = trimesh.load_mesh(print_model_path)
+    #substrate = trimesh.load_mesh(substrate_path)
+
+    bounds = print_model.bounds
+    min_x, max_x = bounds[0][0] - padding, bounds[1][0] + padding
+    min_y, max_y = bounds[0][1] - padding, bounds[1][1] + padding
+
+    vertical_planes = [
+        ([min_x, 0, 0], [1, 0, 0]),
+        ([max_x, 0, 0], [-1, 0, 0]),
+        ([0, min_y, 0], [0, 1, 0]),
+        ([0, max_y, 0], [0, -1, 0])
+    ]
+
+    # We create a smaller, temporary substrate for the heavy math
+    cropped_substrate = substrate.copy()
+    for origin, normal in vertical_planes:
+        cropped_substrate = cropped_substrate.slice_plane(plane_origin=origin, plane_normal=normal)
+        if cropped_substrate.is_empty:
+            print("Error: Print model is entirely outside the substrate XY bounds.")
+            return None, None, None
+
 
     print("Running Opposing-Normal Contact Extraction...")
 
     # 1. Get centers and find closest substrate points
-    face_centers = substrate.triangles_center
+    face_centers = cropped_substrate.triangles_center
     closest_points, distances, pm_face_ids = trimesh.proximity.closest_point(
         print_model, face_centers
     )
@@ -100,7 +120,7 @@ def get_layer_zero(print_model_path, substrate_path, dist_tol=0.5, opposing_thre
     is_close_enough = distances <= dist_tol
 
     # FILTER 2: OPPOSING NORMALS
-    sub_normals = substrate.face_normals
+    sub_normals = cropped_substrate.face_normals
     # Get the exact normal of the substrate face that sits directly under the print model face
     pm_normals = print_model.face_normals[pm_face_ids]
 
@@ -121,7 +141,7 @@ def get_layer_zero(print_model_path, substrate_path, dist_tol=0.5, opposing_thre
         return None, None, None
 
     # Extract the pristine B-Rep skin
-    layer_zero_surface = substrate.submesh([valid_face_indices], append=True)
+    layer_zero_surface = cropped_substrate.submesh([valid_face_indices], append=True)
 
     return layer_zero_surface, print_model, substrate
 
@@ -179,13 +199,36 @@ def main():
     # ---------------------------------------------------------
     # 1. Define your file paths
     # ---------------------------------------------------------
-    base_dir=r'/Users/bipendrabasnet/PycharmProjects/b_rep_confromal/'
-    model_filename=r'cylinder_ring - ring_55mm_dia-1.STL'
-    substrate_filename=r"cylinder_ring - 50_mm_dia-1.stl"
+    base_dir=r'C:\Users\bb237\PycharmProjects\b_repp_offsetting\stl_files\c'
+    model_filename=r'UA - Part4^UA-1.STL'
+    substrate_filename=r"UA - kickoff-1 10cm_dia_substrate_updated v3.step-1.stl"
 
     model_file = os.path.join(base_dir, model_filename)
     substrate_file = os.path.join(base_dir, substrate_filename)
 
+    print("Loading STL files from disk")
+    print_model = trimesh.load_mesh(model_file)
+    substrate = trimesh.load_mesh(substrate_file)
+
+    rot_x, rot_y, rot_z = get_user_orientation_gui(print_model, substrate)
+
+    # 2. Apply those exact angles to the underlying mathematical trimesh objects
+    # We apply them sequentially: X, then Y, then Z
+    if rot_x != 0:
+        print_model = orient_mesh(print_model, axis='X', angle_degrees=rot_x)
+        substrate = orient_mesh(substrate, axis='X', angle_degrees=rot_x)
+    if rot_y != 0:
+        print_model = orient_mesh(print_model, axis='Y', angle_degrees=rot_y)
+        substrate = orient_mesh(substrate, axis='Y', angle_degrees=rot_y)
+    if rot_z != 0:
+        print_model = orient_mesh(print_model, axis='Z', angle_degrees=rot_z)
+        substrate = orient_mesh(substrate, axis='Z', angle_degrees=rot_z)
+
+    # 3. Now that the parts are locked in, run your Broad/Narrow-phase extraction!
+    #layer_zero, print_model, substrate = get_layer_zero(print_model_path, substrate_path)
+
+"""
+extracts the layer 0 or slicing layer  and then show the substrate, print_model and slicing layer
 
     # 2. Extract Layer 0
     layer_0_trimesh, print_model, substrate = get_master_slicing_surface(model_file, substrate_file)
@@ -204,16 +247,25 @@ def main():
     # 4. Visual Verification (Using PyVista)
     # ---------------------------------------------------------
     # Wrap Layer 0 and the substrate
+    print_model_pv = pv.wrap(print_model)
     layer_0_pv = pv.wrap(layer_0_trimesh)
     #substrate_pv = pv.read(substrate_file)
 
     p = pv.Plotter()
+
+    p.add_mesh(print_model_pv, color='lightblue', opacity=0.3, label="Print Model")  # <-- Added to plot
     #p.add_mesh(substrate_pv, color='lightgray', opacity=0.5, label="Substrate")
     p.add_mesh(layer_0_pv, color='red', show_edges=True, line_width=2, label="Layer 0 (Contact)")
 
     # Plot our newly generated offset layers with different colors
     colors = ['blue', 'green', 'orange']
-    """
+    p.add_legend()
+    p.show()
+"""
+
+"""
+showing the displaced layers
+
     for i, offset_mesh in enumerate(offset_layers_trimesh):
         layer_pv = pv.wrap(offset_mesh)
         layer_dist = layer_height * (i + 1)
@@ -225,9 +277,8 @@ def main():
             opacity=0.8,
             label=f"Layer {i + 1} (+{layer_dist:.1f}mm)"
         )
-    """
-    p.add_legend()
-    p.show()
+"""
+
 
 
 if __name__ == "__main__":
