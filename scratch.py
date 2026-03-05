@@ -9,6 +9,75 @@ import trimesh
 import numpy as np
 
 
+def get_master_slicing_surface(print_model_path, substrate_path, padding=5):
+    """
+    Crops the Substrate using the XY Bounding Box of the Print Model.
+    This creates a Master Slicing Surface wide enough to handle overhangs
+    and inverted pyramids.
+    """
+
+    """
+        Extracts the contact skin using Relative Opposing Normals.
+        Even if the substrate is completely vertical, it will find the contact skin.
+        """
+    print("Loading explicit B-Rep meshes...")
+    print_model = trimesh.load_mesh(print_model_path)
+    substrate = trimesh.load_mesh(substrate_path)
+
+    print("Running Opposing-Normal Contact Extraction...")
+
+    print("Calculating Print Model AABB and cropping Substrate...")
+
+    # 1. Get the bounding box of the Print Model
+    # bounds[0] is [minX, minY, minZ], bounds[1] is [maxX, maxY, maxZ]
+    bounds = print_model.bounds
+    min_b = bounds[0]
+    max_b = bounds[1]
+
+    # 1. Apply the Padding to the X and Y bounds
+    min_x = min_b[0] - padding
+    max_x = max_b[0] + padding
+    min_y = min_b[1] - padding
+    max_y = max_b[1] + padding
+
+    # 2. Define the 4 vertical slicing planes with the new padded coordinates
+    vertical_planes = [
+        ([min_x, 0, 0], [1, 0, 0]),  # Min X wall (pointing Right)
+        ([max_x, 0, 0], [-1, 0, 0]),  # Max X wall (pointing Left)
+        ([0, min_y, 0], [0, 1, 0]),  # Min Y wall (pointing Forward)
+        ([0, max_y, 0], [0, -1, 0])  # Max Y wall (pointing Backward)
+    ]
+
+    master_surface = substrate.copy()
+
+    # 4. Sequentially guillotine the substrate with the 4 planes
+    for origin, normal in vertical_planes:
+        master_surface = master_surface.slice_plane(plane_origin=origin, plane_normal=normal)
+
+        if master_surface.is_empty:
+            print("Error: Substrate cropping failed. Is the print model hovering outside the substrate XY bounds?")
+            return None
+
+    print("Filtering out the bottom base to isolate the top curved skin...")
+
+    # We look at the Z-component of every triangle's normal vector.
+    # > 0.01 guarantees we keep faces pointing UP, while throwing away
+    # perfectly vertical walls (0.0) and the bottom flat base (-1.0).
+    upward_facing_indices = np.where(master_surface.face_normals[:, 2] > 0.01)[0]
+
+    if len(upward_facing_indices) == 0:
+        print("Error: No upward-facing surface found after cropping.")
+        return None
+
+    # Extract only the pristine top skin
+    master_skin = master_surface.submesh([upward_facing_indices], append=True)
+
+    print(f"Success! Master Slicing Skin generated with {len(master_skin.faces)} faces.")
+
+
+    return master_skin,print_model,substrate
+
+
 def get_layer_zero(print_model_path, substrate_path, dist_tol=0.5, opposing_threshold=-0.8):
     """
     Extracts the contact skin using Relative Opposing Normals.
@@ -21,9 +90,9 @@ def get_layer_zero(print_model_path, substrate_path, dist_tol=0.5, opposing_thre
     print("Running Opposing-Normal Contact Extraction...")
 
     # 1. Get centers and find closest substrate points
-    face_centers = print_model.triangles_center
-    closest_points, distances, substrate_face_ids = trimesh.proximity.closest_point(
-        substrate, face_centers
+    face_centers = substrate.triangles_center
+    closest_points, distances, pm_face_ids = trimesh.proximity.closest_point(
+        print_model, face_centers
     )
 
     # FILTER 1: DISTANCE
@@ -31,15 +100,15 @@ def get_layer_zero(print_model_path, substrate_path, dist_tol=0.5, opposing_thre
     is_close_enough = distances <= dist_tol
 
     # FILTER 2: OPPOSING NORMALS
-    pm_normals = print_model.face_normals
+    sub_normals = substrate.face_normals
     # Get the exact normal of the substrate face that sits directly under the print model face
-    sub_normals = substrate.face_normals[substrate_face_ids]
+    pm_normals = print_model.face_normals[pm_face_ids]
 
     # Calculate the dot product between the two faces.
     # If they face directly towards each other, dot product = -1.0
     # If they are perpendicular (like a side wall hitting a floor), dot product = 0.0
     # We use sum(a * b, axis=1) for fast row-wise dot products in numpy
-    dot_products = np.sum(pm_normals * sub_normals, axis=1)
+    dot_products = np.sum(sub_normals * pm_normals, axis=1)
 
     # Accept faces that are pointing strongly towards the substrate
     is_opposing = dot_products < opposing_threshold
@@ -52,7 +121,7 @@ def get_layer_zero(print_model_path, substrate_path, dist_tol=0.5, opposing_thre
         return None, None, None
 
     # Extract the pristine B-Rep skin
-    layer_zero_surface = print_model.submesh([valid_face_indices], append=True)
+    layer_zero_surface = substrate.submesh([valid_face_indices], append=True)
 
     return layer_zero_surface, print_model, substrate
 
@@ -110,16 +179,16 @@ def main():
     # ---------------------------------------------------------
     # 1. Define your file paths
     # ---------------------------------------------------------
-    base_dir=r"C:\Users\bb237\OneDrive - The University of Akron\Projects\5 Axis Sys\stil files\Curve"
-    model_filename=r"Assem1 - Part3-1.stl"
-    substrate_filename=r"Assem1 - year_3_3_cm_radius v1.stl"
+    base_dir=r'/Users/bipendrabasnet/PycharmProjects/b_rep_confromal/'
+    model_filename=r'cylinder_ring - ring_55mm_dia-1.STL'
+    substrate_filename=r"cylinder_ring - 50_mm_dia-1.stl"
 
     model_file = os.path.join(base_dir, model_filename)
     substrate_file = os.path.join(base_dir, substrate_filename)
 
 
     # 2. Extract Layer 0
-    layer_0_trimesh, print_model, substrate = get_layer_zero(model_file, substrate_file)
+    layer_0_trimesh, print_model, substrate = get_master_slicing_surface(model_file, substrate_file)
 
     layer_height = 0.5  # Your DIW extrusion height in mm
     num_layers_to_preview = 3
@@ -136,14 +205,15 @@ def main():
     # ---------------------------------------------------------
     # Wrap Layer 0 and the substrate
     layer_0_pv = pv.wrap(layer_0_trimesh)
-    substrate_pv = pv.read(substrate_file)
+    #substrate_pv = pv.read(substrate_file)
 
     p = pv.Plotter()
-    p.add_mesh(substrate_pv, color='lightgray', opacity=0.5, label="Substrate")
+    #p.add_mesh(substrate_pv, color='lightgray', opacity=0.5, label="Substrate")
     p.add_mesh(layer_0_pv, color='red', show_edges=True, line_width=2, label="Layer 0 (Contact)")
 
     # Plot our newly generated offset layers with different colors
     colors = ['blue', 'green', 'orange']
+    """
     for i, offset_mesh in enumerate(offset_layers_trimesh):
         layer_pv = pv.wrap(offset_mesh)
         layer_dist = layer_height * (i + 1)
@@ -155,7 +225,7 @@ def main():
             opacity=0.8,
             label=f"Layer {i + 1} (+{layer_dist:.1f}mm)"
         )
-
+    """
     p.add_legend()
     p.show()
 
