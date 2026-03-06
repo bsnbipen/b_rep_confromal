@@ -195,34 +195,53 @@ def offset_layer(skin_mesh, layer_height):
 
     return offset_skin
 
+
 def main():
     # ---------------------------------------------------------
-    # 1. Define your file paths
+    # A. Load your files (Initial state)
     # ---------------------------------------------------------
-    base_dir=r'C:\Users\bb237\PycharmProjects\b_repp_offsetting\stl_files\c'
-    model_filename=r'UA - Part4^UA-1.STL'
-    substrate_filename=r"UA - kickoff-1 10cm_dia_substrate_updated v3.step-1.stl"
+    base_dir = r'/Users/bipendrabasnet/PycharmProjects/b_rep_confromal/stl_files/c'
+    model_file = os.path.join(base_dir, r'UA - Part4^UA-1.STL')
+    substrate_file = os.path.join(base_dir, r"UA - kickoff-1 10cm_dia_substrate_updated v3.step-1.stl")
 
-    model_file = os.path.join(base_dir, model_filename)
-    substrate_file = os.path.join(base_dir, substrate_filename)
+    print("[1/4] Loading meshes from disk...")
+    mesh_in = trimesh.load_mesh(model_file)
+    sub_in = trimesh.load_mesh(substrate_file)
 
-    print("Loading STL files from disk")
-    print_model = trimesh.load_mesh(model_file)
-    substrate = trimesh.load_mesh(substrate_file)
+    # ---------------------------------------------------------
+    # B. Orientation & Manual Positioning
+    # ---------------------------------------------------------
+    print("[2/4] Launching Orientation GUI...")
+    # This returns the already-rotated Trimesh objects
+    rotated_model, rotated_substrate, final_angles = get_user_orientation_gui(mesh_in, sub_in)
 
-    rot_x, rot_y, rot_z = get_user_orientation_gui(print_model, substrate)
+    print(f"\n[3/4] Orientation Locked at Euler Angles: {final_angles}")
 
-    # 2. Apply those exact angles to the underlying mathematical trimesh objects
-    # We apply them sequentially: X, then Y, then Z
-    if rot_x != 0:
-        print_model = orient_mesh(print_model, axis='X', angle_degrees=rot_x)
-        substrate = orient_mesh(substrate, axis='X', angle_degrees=rot_x)
-    if rot_y != 0:
-        print_model = orient_mesh(print_model, axis='Y', angle_degrees=rot_y)
-        substrate = orient_mesh(substrate, axis='Y', angle_degrees=rot_y)
-    if rot_z != 0:
-        print_model = orient_mesh(print_model, axis='Z', angle_degrees=rot_z)
-        substrate = orient_mesh(substrate, axis='Z', angle_degrees=rot_z)
+    # ---------------------------------------------------------
+    # C. Geometric Extraction (The Cookie Cutter)
+    # ---------------------------------------------------------
+    # We call the cropping function on the ROTATED data
+    master_skin = get_master_slicing_surface(rotated_model, rotated_substrate, padding=5)
+
+    if master_skin is not None:
+        print("[4/4] Initializing Dual Contouring Slicing Engine...")
+
+        # --- VISUAL VALIDATION BEFORE SLICING ---
+        # This confirms everything is ready for your 5-axis layers
+        p = pv.Plotter()
+        p.add_mesh(rotated_model, color='#3070B3', label='Target Model', opacity=0.6)
+        p.add_mesh(master_skin, color='green', label='Master Slicing Surface (Layer 0)')
+        p.add_legend()
+        p.show(title="Final Validation: Pre-Slicing Check")
+
+        # ---------------------------------------------------------
+        # TRIGGER YOUR DUAL CONTOURING HERE
+        # ---------------------------------------------------------
+        # layers = your_slicer.generate_conformal_layers(base_surface=master_skin, target=rotated_model)
+
+        print("\nSlicing Complete. Exporting G-Code...")
+    else:
+        print("[CRITICAL ERROR] Master skin could not be generated. Aborting.")
 
     # 3. Now that the parts are locked in, run your Broad/Narrow-phase extraction!
     #layer_zero, print_model, substrate = get_layer_zero(print_model_path, substrate_path)
