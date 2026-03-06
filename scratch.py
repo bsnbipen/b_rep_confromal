@@ -9,73 +9,47 @@ import trimesh
 import numpy as np
 from GUI_Design import *
 
-def get_master_slicing_surface(print_model_path, substrate_path, padding=5):
+
+def get_master_slicing_surface(print_model, substrate, padding=5):
     """
-    Crops the Substrate using the XY Bounding Box of the Print Model.
-    This creates a Master Slicing Surface wide enough to handle overhangs
-    and inverted pyramids.
+    Ensures the slice is 'On-Par' by calculating bounds of the
+    ACTUALLY rotated trimesh object.
     """
-
-    """
-        Extracts the contact skin using Relative Opposing Normals.
-        Even if the substrate is completely vertical, it will find the contact skin.
-        """
-    print("Loading explicit B-Rep meshes...")
-    print_model = trimesh.load_mesh(print_model_path)
-    substrate = trimesh.load_mesh(substrate_path)
-
-    print("Running Opposing-Normal Contact Extraction...")
-
-    print("Calculating Print Model AABB and cropping Substrate...")
-
-    # 1. Get the bounding box of the Print Model
-    # bounds[0] is [minX, minY, minZ], bounds[1] is [maxX, maxY, maxZ]
+    # 1. Force a re-calculation of the vertex-aligned Bounding Box
+    # Using 'bounds' on a rotated trimesh gives the World-Axis-Aligned Box
     bounds = print_model.bounds
-    min_b = bounds[0]
-    max_b = bounds[1]
+    min_b, max_b = bounds[0], bounds[1]
 
-    # 1. Apply the Padding to the X and Y bounds
-    min_x = min_b[0] - padding
-    max_x = max_b[0] + padding
-    min_y = min_b[1] - padding
-    max_y = max_b[1] + padding
+    # 2. Padded ROI based on the NEW orientation
+    min_x, max_x = min_b[0] - padding, max_b[0] + padding
+    min_y, max_y = min_b[1] - padding, max_b[1] + padding
 
-    # 2. Define the 4 vertical slicing planes with the new padded coordinates
-    vertical_planes = [
-        ([min_x, 0, 0], [1, 0, 0]),  # Min X wall (pointing Right)
-        ([max_x, 0, 0], [-1, 0, 0]),  # Max X wall (pointing Left)
-        ([0, min_y, 0], [0, 1, 0]),  # Min Y wall (pointing Forward)
-        ([0, max_y, 0], [0, -1, 0])  # Max Y wall (pointing Backward)
+    # 3. Apply vertical clipping
+    # These planes act as the 'Projection' of the print head
+    planes = [
+        ([min_x, 0, 0], [1, 0, 0]), ([max_x, 0, 0], [-1, 0, 0]),
+        ([0, min_y, 0], [0, 1, 0]), ([0, max_y, 0], [0, -1, 0])
     ]
 
     master_surface = substrate.copy()
 
-    # 4. Sequentially guillotine the substrate with the 4 planes
-    for origin, normal in vertical_planes:
+    for origin, normal in planes:
         master_surface = master_surface.slice_plane(plane_origin=origin, plane_normal=normal)
 
-        if master_surface.is_empty:
-            print("Error: Substrate cropping failed. Is the print model hovering outside the substrate XY bounds?")
-            return None
+    if master_surface.is_empty:
+        print("[FAIL] Orientation moved model outside substrate bounds.")
+        return None, print_model, substrate
 
-    print("Filtering out the bottom base to isolate the top curved skin...")
+    # 4. Critical: The "Upward" filter must align with the Print Vector (0,0,1)
+    # We use a slightly higher threshold (0.05) to filter noise in complex B-Reps
+    up_idx = np.where(master_surface.face_normals[:, 2] > 0.05)[0]
 
-    # We look at the Z-component of every triangle's normal vector.
-    # > 0.01 guarantees we keep faces pointing UP, while throwing away
-    # perfectly vertical walls (0.0) and the bottom flat base (-1.0).
-    upward_facing_indices = np.where(master_surface.face_normals[:, 2] > 0.01)[0]
+    if len(up_idx) == 0:
+        return None, print_model, substrate
 
-    if len(upward_facing_indices) == 0:
-        print("Error: No upward-facing surface found after cropping.")
-        return None
+    master_skin = master_surface.submesh([up_idx], append=True)
 
-    # Extract only the pristine top skin
-    master_skin = master_surface.submesh([upward_facing_indices], append=True)
-
-    print(f"Success! Master Slicing Skin generated with {len(master_skin.faces)} faces.")
-
-
-    return master_skin,print_model,substrate
+    return master_skin, print_model, substrate
 
 
 def get_layer_zero(print_model, substrate, dist_tol=0.5, opposing_threshold=-0.8,padding=0):
@@ -200,9 +174,9 @@ def main():
     # ---------------------------------------------------------
     # A. Load your files (Initial state)
     # ---------------------------------------------------------
-    base_dir = r'/Users/bipendrabasnet/PycharmProjects/b_rep_confromal/stl_files/c'
-    model_file = os.path.join(base_dir, r'UA - Part4^UA-1.STL')
-    substrate_file = os.path.join(base_dir, r"UA - kickoff-1 10cm_dia_substrate_updated v3.step-1.stl")
+    base_dir = r"C:\Users\bb237\PycharmProjects\b_repp_offsetting\stl_files\ring"
+    model_file = os.path.join(base_dir, r'cylinder_ring - ring_55mm_dia-1.STL')
+    substrate_file = os.path.join(base_dir, r"cylinder_ring - 50_mm_dia-1.stl")
 
     print("[1/4] Loading meshes from disk...")
     mesh_in = trimesh.load_mesh(model_file)
