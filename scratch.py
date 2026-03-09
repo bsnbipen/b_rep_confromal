@@ -4,7 +4,7 @@ import trimesh
 import pyvista as pv
 import numpy as np
 import os
-
+import trimesh.proximity
 import trimesh
 import numpy as np
 from GUI_Design import *
@@ -12,20 +12,32 @@ from GUI_Design import *
 
 def get_master_slicing_surface(print_model, substrate, padding=5):
     """
-    Ensures the slice is 'On-Par' by calculating bounds of the
-    ACTUALLY rotated trimesh object.
+    Choice A: Slices based on the MAXIMUM EXTENT of the model.
+    Ensures that even at 90-degree rotations, the footprint is 'Full'.
     """
-    # 1. Force a re-calculation of the vertex-aligned Bounding Box
-    # Using 'bounds' on a rotated trimesh gives the World-Axis-Aligned Box
-    bounds = print_model.bounds
-    min_b, max_b = bounds[0], bounds[1]
+    # 1. Calculate the largest dimension of the model once
+    # We use the peak-to-peak (ptp) value of the original size
+    extents = print_model.bounds[1] - print_model.bounds[0]
+    max_dim = extents.max()  # This will be ~55mm for your part
 
-    # 2. Padded ROI based on the NEW orientation
-    min_x, max_x = min_b[0] - padding, max_b[0] + padding
-    min_y, max_y = min_b[1] - padding, max_b[1] + padding
 
-    # 3. Apply vertical clipping
-    # These planes act as the 'Projection' of the print head
+    # 2. Get the current center of the rotated model
+    center = print_model.centroid
+
+    # --- DEBUG SECTION ---
+    print(f"\n--- [DEBUG: CHOICE A] ---")
+    print(f"Model World Center: {center}")
+    print(f"Model AABB (Current): Min {print_model.bounds[0]} | Max {print_model.bounds[1]}")
+    print(f"Calculated Max Dimension: {max_dim:.2f} mm")
+
+    # 3. Create a fixed-size footprint centered on the model
+    # This prevents the 'sliver' effect by forcing a square ROI
+    half_size = (max_dim / 2.0) + padding
+
+    min_x, max_x = center[0] - half_size, center[0] + half_size
+    min_y, max_y = center[1] - half_size, center[1] + half_size
+
+    # 4. Clipping Logic
     planes = [
         ([min_x, 0, 0], [1, 0, 0]), ([max_x, 0, 0], [-1, 0, 0]),
         ([0, min_y, 0], [0, 1, 0]), ([0, max_y, 0], [0, -1, 0])
@@ -40,85 +52,92 @@ def get_master_slicing_surface(print_model, substrate, padding=5):
         print("[FAIL] Orientation moved model outside substrate bounds.")
         return None, print_model, substrate
 
-    # 4. Critical: The "Upward" filter must align with the Print Vector (0,0,1)
-    # We use a slightly higher threshold (0.05) to filter noise in complex B-Reps
-    up_idx = np.where(master_surface.face_normals[:, 2] > 0.05)[0]
+    # 5. Extract the upward-facing surface
+    # We keep the threshold low to maintain the curved B-Rep quality
+    up_idx = np.where(master_surface.face_normals[:, 2] > 0.01)[0]
 
     if len(up_idx) == 0:
+        print("[FAIL] No upward faces found. Check rotation.")
         return None, print_model, substrate
 
     master_skin = master_surface.submesh([up_idx], append=True)
 
+    print(f"[SUCCESS] 'Choice A' Skin Extracted: {len(master_skin.faces)} faces.")
     return master_skin, print_model, substrate
 
 
-def get_layer_zero(print_model, substrate, dist_tol=0.5, opposing_threshold=-0.8,padding=0):
+def get_layer_zero(print_model, substrate, dist_tol=1.0, opposing_threshold=-0.7, padding=15):
     """
-    Extracts the contact skin using Relative Opposing Normals.
-    Even if the substrate is completely vertical, it will find the contact skin.
+    Total Coverage Version: Dynamically expands the yellow ROI box to
+    ensure the entire rotated footprint is captured.
     """
-    #print("Loading explicit B-Rep meshes...")
-    #print_model = trimesh.load_mesh(print_model_path)
-    #substrate = trimesh.load_mesh(substrate_path)
-
+    # --- 1. DYNAMIC ROTATED BOUNDS ---
+    # We get the min/max of the model in its CURRENT orientation
     bounds = print_model.bounds
-    min_x, max_x = bounds[0][0] - padding, bounds[1][0] + padding
-    min_y, max_y = bounds[0][1] - padding, bounds[1][1] + padding
+    min_pts, max_pts = bounds[0], bounds[1]
 
-    vertical_planes = [
-        ([min_x, 0, 0], [1, 0, 0]),
-        ([max_x, 0, 0], [-1, 0, 0]),
-        ([0, min_y, 0], [0, 1, 0]),
-        ([0, max_y, 0], [0, -1, 0])
-    ]
+    # Calculate the current width and depth
+    width_x = max_pts[0] - min_pts[0]
+    width_y = max_pts[1] - min_pts[1]
 
-    # We create a smaller, temporary substrate for the heavy math
-    cropped_substrate = substrate.copy()
-    for origin, normal in vertical_planes:
-        cropped_substrate = cropped_substrate.slice_plane(plane_origin=origin, plane_normal=normal)
-        if cropped_substrate.is_empty:
-            print("Error: Print model is entirely outside the substrate XY bounds.")
-            return None, None, None
+    # The center of the 'shadow' on the XY plane
+    center_x = (max_pts[0] + min_pts[0]) / 2.0
+    center_y = (max_pts[1] + min_pts[1]) / 2.0
 
+    # Expand by padding
+    min_x, max_x = min_pts[0] - padding, max_pts[0] + padding
+    min_y, max_y = min_pts[1] - padding, max_pts[1] + padding
 
-    print("Running Opposing-Normal Contact Extraction...")
-
-    # 1. Get centers and find closest substrate points
-    face_centers = cropped_substrate.triangles_center
-    closest_points, distances, pm_face_ids = trimesh.proximity.closest_point(
-        print_model, face_centers
+    # --- 2. DEBUG ASSET: THE YELLOW BOX ---
+    # We make the box tall enough to enclose the whole model height
+    height_z = max_pts[2] - min_pts[2]
+    debug_roi_box = trimesh.creation.box(
+        extents=[max_x - min_x, max_y - min_y, height_z + 10],
+        transform=trimesh.transformations.translation_matrix([center_x, center_y, (max_pts[2] + min_pts[2]) / 2.0])
     )
 
-    # FILTER 1: DISTANCE
-    # Expanded to 0.5mm to aggressively swallow CAD chordal deviation gapsgit remote add origin git@github.com:bsnbipen/b_rep_confromal.git
-    is_close_enough = distances <= dist_tol
+    # --- 3. THE GUILLOTINE ---
+    cropped_sub = substrate.copy()
+    planes = [
+        ([min_x, 0, 0], [1, 0, 0]), ([max_x, 0, 0], [-1, 0, 0]),
+        ([0, min_y, 0], [0, 1, 0]), ([0, max_y, 0], [0, -1, 0])                                                         #creating planes along with normals, we can tell which side of plane are we keeping
+    ]
+    for origin, normal in planes:
+        cropped_sub = cropped_sub.slice_plane(origin, normal)
 
-    # FILTER 2: OPPOSING NORMALS
-    sub_normals = cropped_substrate.face_normals
-    # Get the exact normal of the substrate face that sits directly under the print model face
+    cropped_sub.merge_vertices()
+
+    # --- 4. SEED & GROWTH (Same as before but with expanded area) ---
+    face_centers = cropped_sub.triangles_center
+    _, distances, pm_face_ids = trimesh.proximity.closest_point(print_model, face_centers)
+    sub_normals = cropped_sub.face_normals
     pm_normals = print_model.face_normals[pm_face_ids]
-
-    # Calculate the dot product between the two faces.
-    # If they face directly towards each other, dot product = -1.0
-    # If they are perpendicular (like a side wall hitting a floor), dot product = 0.0
-    # We use sum(a * b, axis=1) for fast row-wise dot products in numpy
     dot_products = np.sum(sub_normals * pm_normals, axis=1)
 
-    # Accept faces that are pointing strongly towards the substrate
-    is_opposing = dot_products < opposing_threshold
+    seed_indices = np.where((distances <= dist_tol) & (dot_products < opposing_threshold))[0]                           #plane underneath the print model in substrate
 
-    # COMBINE FILTERS
-    valid_face_indices = np.where(is_close_enough & is_opposing)[0]
+    # Directional alignment for the 'Green' extension
+    v_nozzle = -print_model.face_normals.mean(axis=0)   #ver
+    v_nozzle /= (np.linalg.norm(v_nozzle) + 1e-8)
+    alignment = np.dot(sub_normals, v_nozzle)
 
-    if len(valid_face_indices) == 0:
-        print("Error: No valid contact faces found. Check CAD assembly.")
-        return None, None, None
+    # Take EVERYTHING in the box that faces the nozzle
+    valid_indices = np.where(alignment > 0.05)[0]
 
-    # Extract the pristine B-Rep skin
-    layer_zero_surface = cropped_substrate.submesh([valid_face_indices], append=True)
+    # Combine Seed + ROI
+    final_indices = list(set(seed_indices).union(set(valid_indices)))
+    layer_zero_surface = cropped_sub.submesh([final_indices], append=True)
 
-    return layer_zero_surface, print_model, substrate
+    # Clean up shrapnel
+    try:
+        components = layer_zero_surface.split(only_watertight=False)
+        layer_zero_surface = max(components, key=lambda m: len(m.faces))
+    except:
+        pass
 
+    seed_mesh = cropped_sub.submesh([seed_indices], append=True) if len(seed_indices) > 0 else None
+
+    return layer_zero_surface, debug_roi_box, seed_mesh
 
 def generate_offset_surface(base_skin, layer_index, layer_height):
     """
@@ -170,12 +189,54 @@ def offset_layer(skin_mesh, layer_height):
     return offset_skin
 
 
+def extract_ordered_perimeter(interface_mesh):
+    # If the mesh has no boundary, outline() returns an empty Path3D
+    path_obj = interface_mesh.outline()
+    segments = path_obj.discrete
+
+    if not segments or len(segments) == 0:
+        print("DEBUG: No discrete segments found in outline.")
+        return []  # Return empty list, not None
+
+    results = []
+    from trimesh.proximity import closest_point
+
+    for seg in segments:
+        _, _, face_indices = closest_point(interface_mesh, seg)
+        path_normals = interface_mesh.face_normals[face_indices]
+
+        results.append({
+            'points': seg,
+            'normals': path_normals
+        })
+    print(results)
+    return results
+
+
+def extract_ordered_perimeter(interface_mesh):
+    if interface_mesh is None or len(interface_mesh.faces) == 0:
+        return None, None
+
+    path_obj = interface_mesh.outline()
+    segments = path_obj.discrete
+    if not segments: return None, None
+
+    path_points = max(segments, key=len)
+
+    # USE THE MODULE CALL HERE TOO
+    from trimesh.proximity import closest_point
+    _, _, face_indices = closest_point(interface_mesh, path_points)
+    path_normals = interface_mesh.face_normals[face_indices]
+
+    return path_points, path_normals
+
+
 def main():
     # ---------------------------------------------------------
     # A. Load your files (Initial state)
     # ---------------------------------------------------------
     base_dir = r"C:\Users\bb237\PycharmProjects\b_repp_offsetting\stl_files\ring"
-    model_file = os.path.join(base_dir, r'cylinder_ring - ring_55mm_dia-1.STL')
+    model_file = os.path.join(base_dir, r'cylinder_ring - ring_55mm_dia-1.stl')
     substrate_file = os.path.join(base_dir, r"cylinder_ring - 50_mm_dia-1.stl")
 
     print("[1/4] Loading meshes from disk...")
