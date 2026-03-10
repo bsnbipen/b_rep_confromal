@@ -8,19 +8,17 @@ import threading
 from trimesh.proximity import closest_point
 from scratch import *
 
+def ensure_trimesh(obj):
+    if isinstance(obj, str):
+        return trimesh.load(obj)
+    return obj
 
 def get_user_orientation_gui(print_model_in, substrate_in):
     # --- 1. INITIAL GEOMETRY SETUP ---
-    def ensure_trimesh(obj):
-        if isinstance(obj, str): return trimesh.load(obj)
-        return obj
-
     try:
-        # Store original "Raw" meshes to prevent rotation drift
         tm_pm_orig = ensure_trimesh(print_model_in)
         tm_sub_orig = ensure_trimesh(substrate_in)
 
-        # Dynamic Grid Scaling (Fits the grid to the model size)
         all_pts = np.vstack([tm_pm_orig.vertices, tm_sub_orig.vertices])
         model_size = np.ptp(all_pts, axis=0).max()
         GRID_STEP = 5.0 if model_size < 75 else 10.0
@@ -28,20 +26,44 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         max_v = (np.ceil(np.abs(all_pts).max() / GRID_STEP) * GRID_STEP) + GRID_STEP
         fixed_bounds = [-max_v, max_v, -max_v, max_v, -max_v, max_v]
     except Exception as e:
-        print(f"Loading Error: {e}");
+        print(f"Loading Error: {e}")
         return print_model_in, substrate_in, (0, 0, 0)
 
-    # UI State tracking
+    # UI State
     state = {'x': 0, 'y': 0, 'z': 0}
     ui_settings = {
         'show_model_right': True,
-        'show_seeds_right': True  # <-- Add this line
+        'show_core_right': True,
+        'show_normals_view3': True,
     }
+
+    # Computed geometry assets
     slice_assets = {
-        'skin_pv': None,  # The Green Surface
-        'seeds_pv': None,  # The Red Surface
-        'roi_pv': None  # The Yellow ROI Box
+        "skin_tm": None,        # green substrate envelope
+        "skin_pv": None,
+
+        "core_tm": None,        # red strict contact core
+        "core_pv": None,
+
+        "roi_pv": None,         # yellow/black ROI box
+
+        "patch_tm": None,       # blue model-side first-layer patch
+        "patch_pv": None,
+
+        "perimeter_loops": [],  # ordered loops for View 4
+        "debug": None
     }
+
+    def clear_slice_assets():
+        slice_assets["skin_tm"] = None
+        slice_assets["skin_pv"] = None
+        slice_assets["core_tm"] = None
+        slice_assets["core_pv"] = None
+        slice_assets["roi_pv"] = None
+        slice_assets["patch_tm"] = None
+        slice_assets["patch_pv"] = None
+        slice_assets["perimeter_loops"] = []
+        slice_assets["debug"] = None
 
     p = pv.Plotter(shape=(2, 2), window_size=[1200, 900])
     p.set_background('white', all_renderers=True)
@@ -51,45 +73,61 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         Simulates a 5-axis rotary table by pivoting all rotations
         around the substrate's centroid.
         """
-        # Convert UI Degrees to Math Radians
         rx, ry, rz = np.radians(state['x']), np.radians(state['y']), np.radians(state['z'])
 
         pm = tm_pm_orig.copy()
         sub = tm_sub_orig.copy()
 
-        # --- THE KEY FIX: Shared Pivot Point ---
-        # Calculate the pivot once from the original substrate to avoid drift
         pivot = tm_sub_orig.centroid
 
-        # Create individual rotation matrices around the pivot
-        # We use concatenation to apply X, then Y, then Z in one clean step
         matrix_x = trimesh.transformations.rotation_matrix(rx, [1, 0, 0], point=pivot)
         matrix_y = trimesh.transformations.rotation_matrix(ry, [0, 1, 0], point=pivot)
         matrix_z = trimesh.transformations.rotation_matrix(rz, [0, 0, 1], point=pivot)
 
-        # Combined Matrix: Z * Y * X
         full_matrix = trimesh.transformations.concatenate_matrices(matrix_z, matrix_y, matrix_x)
 
-        # Apply the SAME transformation to BOTH meshes
         pm.apply_transform(full_matrix)
         sub.apply_transform(full_matrix)
 
         return pm, sub
 
     def cmd_generate_slice():
-        # Get live meshes based on the slider/button rotations
+        clear_slice_assets()
+
         tm_pm, tm_sub = get_rotated_trimeshes()
+        layer_h = float(layer_height_var.get())
 
-        # Call the bulletproof function we refined
-        skin, roi_box, seed_pts = get_layer_zero(tm_pm, tm_sub)
+        # 1. Get substrate-side working surface
+        skin, roi_box, core_mesh = get_layer_zero(tm_pm, tm_sub)
 
-        # Wrap them for PyVista
-        if skin:
-            slice_assets['skin_pv'] = pv.wrap(skin)
-        if seed_pts:
-            slice_assets['seeds_pv'] = pv.wrap(seed_pts)
-        if roi_box:
-            slice_assets['roi_pv'] = pv.wrap(roi_box)
+        if skin is not None and len(skin.faces) > 0:
+            slice_assets["skin_tm"] = skin
+            slice_assets["skin_pv"] = pv.wrap(skin)
+
+            # 2. Get model-side first-layer patch + perimeter
+            patch_mesh, perimeter_loops, debug = extract_first_layer_intersection_perimeter(
+                layer_zero_surface=skin,
+                print_model=tm_pm,
+                layer_height=layer_h,
+                gap_tol=0.10,
+                euclid_tol=layer_h + 0.25,
+                min_component_faces=20,
+                keep_largest_only=True,
+            )
+
+            if patch_mesh is not None and len(patch_mesh.faces) > 0:
+                slice_assets["patch_tm"] = patch_mesh
+                slice_assets["patch_pv"] = pv.wrap(patch_mesh)
+
+            slice_assets["perimeter_loops"] = perimeter_loops
+            slice_assets["debug"] = debug
+
+        if core_mesh is not None and len(core_mesh.faces) > 0:
+            slice_assets["core_tm"] = core_mesh
+            slice_assets["core_pv"] = pv.wrap(core_mesh)
+
+        if roi_box is not None and len(roi_box.faces) > 0:
+            slice_assets["roi_pv"] = pv.wrap(roi_box)
 
         update_3d_view()
 
@@ -97,158 +135,256 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         tm_pm, tm_sub = get_rotated_trimeshes()
         pm_pv, sub_pv = pv.wrap(tm_pm), pv.wrap(tm_sub)
 
-        # --- VIEW 1: TOP-LEFT (Machine Config) ---
+        # =====================================================
+        # VIEW 1: TOP-LEFT (Machine Config)
+        # =====================================================
         p.subplot(0, 0)
-        p.add_mesh(pm_pv, color='#3070B3', name='pm_l', show_edges=True, edge_color='black', line_width=0.5,
-                   reset_camera=False)
-        p.add_mesh(sub_pv, color='#D0D0D0', opacity=0.3, name='sub_l', show_edges=True, edge_color='gray',
-                   line_width=0.5, reset_camera=False)
-        p.add_text("1. Machine View", font_size=10, color='gray', position='upper_left', name='txt_l')
+        p.add_mesh(
+            pm_pv, color='#3070B3', name='pm_l',
+            show_edges=True, edge_color='black', line_width=0.5,
+            reset_camera=False
+        )
+        p.add_mesh(
+            sub_pv, color='#D0D0D0', opacity=0.3, name='sub_l',
+            show_edges=True, edge_color='gray', line_width=0.5,
+            reset_camera=False
+        )
+        p.add_text("1. Machine View", font_size=10, color='gray',
+                   position='upper_left', name='txt_l')
         p.show_grid(color='#AAAAAA', bounds=fixed_bounds)
 
-        # --- VIEW 2: TOP-RIGHT (Slice Preview) ---
+        # =====================================================
+        # VIEW 2: TOP-RIGHT (Slice Preview)
+        # =====================================================
         p.subplot(0, 1)
+
         legend_entries = []
         model_opacity = 1.0 if ui_settings['show_model_right'] else 0.0
-        p.add_mesh(pm_pv, color='#3070B3', name='pm_r', opacity=model_opacity, show_edges=True, edge_color='black',
-                   reset_camera=False)
+
+        p.add_mesh(
+            pm_pv, color='#3070B3', name='pm_r',
+            opacity=model_opacity, show_edges=True, edge_color='black',
+            reset_camera=False
+        )
         legend_entries.append(["Print Model", "#3070B3"])
 
         if slice_assets['skin_pv'] is not None:
-            p.add_mesh(slice_assets['skin_pv'], color='#2ECC71', name='skin_r', show_edges=True, edge_color='darkgreen',
-                       reset_camera=False)
-            legend_entries.append(["Unified Layer Zero", "#2ECC71"])
+            p.add_mesh(
+                slice_assets['skin_pv'], color='#2ECC71', name='skin_r',
+                show_edges=True, edge_color='darkgreen',
+                reset_camera=False
+            )
+            legend_entries.append(["Layer Zero Envelope", "#2ECC71"])
         else:
             try:
                 p.remove_actor('skin_r', render=False)
-            except:
+            except Exception:
                 pass
 
-        if slice_assets['seeds_pv'] is not None:
-            seed_opacity = 1.0 if ui_settings['show_seeds_right'] else 0.0
-            p.add_mesh(slice_assets['seeds_pv'], color='red', name='seeds_r', opacity=seed_opacity, reset_camera=False)
-            if ui_settings['show_seeds_right']: legend_entries.append(["Contact Zone", "red"])
+        if slice_assets['core_pv'] is not None:
+            core_opacity = 1.0 if ui_settings['show_core_right'] else 0.0
+            p.add_mesh(
+                slice_assets['core_pv'], color='red', name='core_r',
+                opacity=core_opacity, reset_camera=False
+            )
+            if ui_settings['show_core_right']:
+                legend_entries.append(["Contact Core", "red"])
         else:
             try:
-                p.remove_actor('seeds_r', render=False)
-            except:
+                p.remove_actor('core_r', render=False)
+            except Exception:
                 pass
 
         if slice_assets['roi_pv'] is not None:
-            p.add_mesh(slice_assets['roi_pv'], color='black', name='roi_r', style='wireframe', opacity=0.3,
-                       line_width=1, reset_camera=False)
+            p.add_mesh(
+                slice_assets['roi_pv'], color='black', name='roi_r',
+                style='wireframe', opacity=0.3, line_width=1,
+                reset_camera=False
+            )
             legend_entries.append(["ROI Boundary", "black"])
         else:
             try:
                 p.remove_actor('roi_r', render=False)
-            except:
+            except Exception:
                 pass
 
         if legend_entries:
-            p.add_legend(legend_entries, bcolor='white', border=True, size=(0.2, 0.2), name='leg_r')
+            p.add_legend(
+                legend_entries, bcolor='white', border=True,
+                size=(0.24, 0.24), name='leg_r'
+            )
 
-        p.add_text("2. Interaction Preview", font_size=10, color='gray', position='upper_left', name='txt_m')
+        p.add_text("2. Interaction Preview", font_size=10, color='gray',
+                   position='upper_left', name='txt_m')
         p.show_grid(color='#AAAAAA', bounds=fixed_bounds)
 
-        # --- VIEW 3: BOTTOM-LEFT (Isolated Detail - BELOW VIEW 1) ---
-        p.subplot(1, 0)  # Row 1, Column 0
-        if slice_assets['skin_pv'] is not None:
-            p.add_mesh(slice_assets['skin_pv'], color='#2ECC71', name='skin_iso', show_edges=True,
-                       edge_color='darkgreen')
-            p.add_text("3. Surface Detail", font_size=10, color='darkgreen', position='upper_left', name='txt_iso')
-            p.reset_camera(render=False)  # Zoom in specifically on the layer
+        # =====================================================
+        # VIEW 3: BOTTOM-LEFT (Isolated Detail)
+        # =====================================================
+        p.subplot(1, 0)
+
+        # Clear old normals actor if needed
+        try:
+            p.remove_actor('skin_normals_iso', render=False)
+        except Exception:
+            pass
+
+        if slice_assets['skin_pv'] is not None and slice_assets['skin_tm'] is not None:
+            p.add_mesh(
+                slice_assets['skin_pv'],
+                color='#2ECC71',
+                name='skin_iso',
+                show_edges=True,
+                edge_color='darkgreen'
+            )
+            p.add_text(
+                "3. Surface Detail", font_size=10, color='darkgreen',
+                position='upper_left', name='txt_iso'
+            )
+
+            if ui_settings.get('show_normals_view3', True):
+                skin_tm = slice_assets['skin_tm']
+
+                # Triangle centers and face normals
+                centers = skin_tm.triangles_center
+                normals = skin_tm.face_normals
+
+                # Build a PyVista point cloud at triangle centers
+                normals_pd = pv.PolyData(centers)
+                normals_pd["normals"] = normals
+
+                # Create arrow glyphs
+                arrows = normals_pd.glyph(
+                    orient="normals",
+                    scale=False,
+                    factor=2.0  # adjust this size as needed
+                )
+
+                p.add_mesh(
+                    arrows,
+                    color='red',
+                    name='skin_normals_iso'
+                )
+
+            p.reset_camera(render=False)
         else:
             try:
                 p.remove_actor('skin_iso', render=False)
-                p.remove_actor('txt_iso', render=False)
-            except:
+            except Exception:
                 pass
-
-        # --- VIEW 4: BOTTOM-RIGHT (Final Integrated Logic) ---
+            try:
+                p.remove_actor('txt_iso', render=False)
+            except Exception:
+                pass
+            try:
+                p.remove_actor('skin_normals_iso', render=False)
+            except Exception:
+                pass
+        # =====================================================
+        # VIEW 4: BOTTOM-RIGHT (First-Layer Perimeter / Toolpath)
+        # =====================================================
         p.subplot(1, 1)
 
-        try:
-            from trimesh.proximity import closest_point
+        # Clear old dynamic actors in View 4
+        for actor_name in ['v4_skin', 'v4_patch', 'txt_stats', 'txt_v4_err', 'txt_v4_title']:
+            try:
+                p.remove_actor(actor_name, render=False)
+            except Exception:
+                pass
 
-            # 1. Logic remains the same to find the contact area
-            _, distances, _ = closest_point(tm_pm, tm_sub.triangles_center)
-            contact_indices = np.where(distances < 0.05)[0]
+        for i in range(100):
+            for prefix in ['perim_pts_', 'perim_norms_']:
+                try:
+                    p.remove_actor(f'{prefix}{i}', render=False)
+                except Exception:
+                    pass
 
-            if len(contact_indices) > 0:
-                interface_mesh = tm_sub.submesh([contact_indices], append=True)
+        p.add_text(
+            "4. First-Layer Perimeter", font_size=10, color='gray',
+            position='upper_left', name='txt_v4_title'
+        )
 
-                # --- IMPROVEMENT: Keep patch visible but faint to verify intersection ---
-                p.add_mesh(pv.wrap(interface_mesh), color='#3498DB', name='diw_patch', opacity=0.3)
+        if slice_assets['skin_pv'] is not None:
+            p.add_mesh(
+                slice_assets['skin_pv'], color='#2ECC71', name='v4_skin',
+                opacity=0.20, show_edges=True, edge_color='darkgreen',
+                reset_camera=False
+            )
 
-                # 2. Extract ALL Perimeters (Returns a LIST of dicts)
-                path_data_list = extract_ordered_perimeter(interface_mesh)
+        if slice_assets['patch_pv'] is not None:
+            p.add_mesh(
+                slice_assets['patch_pv'], color='#3498DB', name='v4_patch',
+                opacity=0.40, show_edges=True, edge_color='navy',
+                reset_camera=False
+            )
 
-                if path_data_list and isinstance(path_data_list, list):
-                    total_len = 0
+            path_data_list = slice_assets.get('perimeter_loops', [])
 
-                    for i, path_data in enumerate(path_data_list):
-                        pts = path_data['points']
-                        norms = path_data['normals']
+            if path_data_list:
+                total_len = 0.0
 
-                        # Create PolyData for THIS specific loop
-                        loop_pv = pv.PolyData(pts)
-                        loop_pv.point_data["normals"] = norms
+                for i, path_data in enumerate(path_data_list):
+                    pts = path_data['points']
+                    norms = path_data['normals']
 
-                        # Unique names prevent the inner ring from deleting the outer ring
-                        name_pts = f'diw_pts_{i}'
-                        name_norms = f'diw_norms_{i}'
+                    loop_pv = pv.PolyData(pts)
+                    loop_pv.point_data["normals"] = norms
 
-                        # Render as points
-                        p.add_mesh(loop_pv,
-                                   color='yellow',
-                                   point_size=12.0,  # Increased for visibility
-                                   render_points_as_spheres=True,
-                                   name=name_pts)
+                    # Yellow perimeter points
+                    p.add_mesh(
+                        loop_pv, color='yellow', point_size=10.0,
+                        render_points_as_spheres=True, name=f'perim_pts_{i}',
+                        reset_camera=False
+                    )
 
-                        # Render the red arrows
-                        arrows = loop_pv.glyph(orient="normals", scale=False, factor=3.0)
-                        p.add_mesh(arrows, color='red', name=name_norms)
+                    # Red nozzle normal arrows
+                    arrows = loop_pv.glyph(orient="normals", scale=False, factor=3.0)
+                    p.add_mesh(
+                        arrows, color='red', name=f'perim_norms_{i}',
+                        reset_camera=False
+                    )
 
-                        # Calculate path length including loop closure
-                        if len(pts) > 1:
-                            segment_dist = np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()
-                            closure_dist = np.linalg.norm(pts[-1] - pts[0])
-                            total_len += segment_dist + closure_dist
+                    if len(pts) > 1:
+                        total_len += np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()
+                        if path_data.get('is_closed', True):
+                            total_len += np.linalg.norm(pts[-1] - pts[0])
 
-                    p.add_text(f"Total Path: {total_len:.2f} mm", position='lower_right', font_size=9, name='txt_stats')
-
-                    # --- IMPROVEMENT: Force camera to find the new points ---
-                    p.reset_camera()
-                    try:
-                        p.remove_actor('txt_v4_err', render=False)
-                    except:
-                        pass
-                else:
-                    # If patch exists but no loops found, it might be a closed manifold
-                    p.add_text("Patch found, but no open boundaries.", position='upper_left', color='orange',
-                               name='txt_v4_err')
+                p.add_text(
+                    f"Total Path: {total_len:.2f} mm",
+                    position='lower_right', font_size=9, name='txt_stats'
+                )
+                p.reset_camera(render=False)
             else:
-                # Cleanup
-                for i in range(10):
-                    p.remove_actor(f'diw_pts_{i}', render=False)
-                    p.remove_actor(f'diw_norms_{i}', render=False)
-                p.remove_actor('diw_patch', render=False)
-                p.add_text("No Contact Detected", position='upper_left', color='red', name='txt_v4_err')
-
-        except Exception as e:
-            print(f"Interface Generation Error: {e}")
+                p.add_text(
+                    "No Boundary Found", position='upper_left',
+                    color='orange', name='txt_v4_err'
+                )
+        else:
+            p.add_text(
+                "Generate Slice First", position='upper_left',
+                color='gray', name='txt_v4_err'
+            )
 
         p.render()
 
-    # --- 3. TKINTER UI ---
+    # =====================================================
+    # TKINTER UI
+    # =====================================================
     root = tk.Tk()
-    root.title(f"5-Axis Master Slicer | B-Rep Pipeline")
-    root.geometry("380x850")
+    root.title("5-Axis Master Slicer | B-Rep Pipeline")
+    root.geometry("380x880")
     root.attributes('-topmost', True)
+
     frame = ttk.Frame(root, padding="20")
     frame.pack(expand=True, fill="both")
 
     ttk.Label(frame, text="GEOMETRIC EXTRACTION", font=('Arial', 10, 'bold')).pack(pady=(5, 5))
+
+    layer_height_var = tk.DoubleVar(value=0.40)
+
+    ttk.Label(frame, text="Layer Height (mm)", font=('Arial', 9)).pack(pady=(5, 2))
+    ttk.Entry(frame, textvariable=layer_height_var).pack(fill='x', pady=(0, 8))
+
     ttk.Button(frame, text="GENERATE SLICE (CURRENT ORIENT)", command=cmd_generate_slice).pack(fill='x', pady=5)
 
     ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=15)
@@ -260,58 +396,64 @@ def get_user_orientation_gui(print_model_in, substrate_in):
 
         def rot(v):
             state[axis] = (state[axis] + v) % 360
-
-            # --- THE FIX: Clear EVERYTHING stale ---
-            slice_assets['skin_pv'] = None
-            slice_assets['seeds_pv'] = None
-            slice_assets['roi_pv'] = None
-
+            clear_slice_assets()
             update_3d_view()
 
         ttk.Button(btn_f, text="+90°", command=lambda: rot(90)).pack(side='left', expand=True, fill='x', padx=2)
         ttk.Button(btn_f, text="-90°", command=lambda: rot(-90)).pack(side='left', expand=True, fill='x', padx=2)
 
-    for a in ['x', 'y', 'z']: create_axis_group(a)
+    for a in ['x', 'y', 'z']:
+        create_axis_group(a)
 
-    view_var = tk.BooleanVar(value=True)
-
-    # ... (After your 'for a in ['x', 'y', 'z']: create_axis_group(a)' loop) ...
-
-    # --- NEW LAYER VISIBILITY SECTION ---
     ttk.Label(frame, text="LAYER VISIBILITY", font=('Arial', 10, 'bold')).pack(pady=(15, 5))
 
-    # 1. Model Visibility Toggle
-    view_var = tk.BooleanVar(value=True)
+    model_var = tk.BooleanVar(value=True)
+    normals_var = tk.BooleanVar(value=True)
+
+    def toggle_normals_view3():
+        ui_settings['show_normals_view3'] = normals_var.get()
+        update_3d_view()
+
+    normals_f = ttk.Frame(frame)
+    normals_f.pack(fill='x')
+    ttk.Checkbutton(
+        normals_f,
+        text="Show Surface Normals (View 3)",
+        variable=normals_var,
+        command=toggle_normals_view3
+    ).pack(side='left', padx=10)
+
 
     def toggle_model():
-        ui_settings['show_model_right'] = view_var.get()
+        ui_settings['show_model_right'] = model_var.get()
         update_3d_view()
 
     model_f = ttk.Frame(frame)
     model_f.pack(fill='x')
-    ttk.Checkbutton(model_f, text="Show Print Model", variable=view_var,
-                    command=toggle_model).pack(side='left', padx=10)
+    ttk.Checkbutton(
+        model_f, text="Show Print Model",
+        variable=model_var, command=toggle_model
+    ).pack(side='left', padx=10)
 
-    # 2. Seed Visibility Toggle (The code you asked about)
-    seeds_var = tk.BooleanVar(value=True)
+    core_var = tk.BooleanVar(value=True)
 
-    def toggle_seeds():
-        ui_settings['show_seeds_right'] = seeds_var.get()
+    def toggle_core():
+        ui_settings['show_core_right'] = core_var.get()
         update_3d_view()
 
-    seed_f = ttk.Frame(frame)
-    seed_f.pack(fill='x')
-    ttk.Checkbutton(seed_f, text="Show Red Seeds", variable=seeds_var,
-                    command=toggle_seeds).pack(side='left', padx=10)
+    core_f = ttk.Frame(frame)
+    core_f.pack(fill='x')
+    ttk.Checkbutton(
+        core_f, text="Show Red Core",
+        variable=core_var, command=toggle_core
+    ).pack(side='left', padx=10)
 
-    # ... (Before your 'on_finish' and 'CONFIRM' button) ...
-    # --- FINAL RETURN DATA ---
     final_res = {"pm": None, "sub": None}
 
     def on_finish():
         pm_f, sub_f = get_rotated_trimeshes()
         final_res["pm"], final_res["sub"] = pm_f, sub_f
-        root.quit() # Stop the loop first
+        root.quit()
         root.destroy()
         p.close()
 
@@ -319,8 +461,8 @@ def get_user_orientation_gui(print_model_in, substrate_in):
     ttk.Button(frame, text="CONFIRM & START DUAL CONTOURING", command=on_finish).pack(fill='x', pady=10)
 
     def launch():
-        # Setup the three active quadrants (leaving 1,1 empty for now)
-        active_quadrants = [(0, 0), (0, 1), (1, 0)]
+        # Initialize all four quadrants
+        active_quadrants = [(0, 0), (0, 1), (1, 0), (1, 1)]
         for r, c in active_quadrants:
             p.subplot(r, c)
             p.show_grid(bounds=fixed_bounds)
@@ -331,6 +473,7 @@ def get_user_orientation_gui(print_model_in, substrate_in):
 
     root.after(100, launch)
     root.mainloop()
+
     return final_res["pm"], final_res["sub"], (state['x'], state['y'], state['z'])
 
 def orient_mesh(mesh, axis, angle_degrees, pivot=[0, 0, 0]):

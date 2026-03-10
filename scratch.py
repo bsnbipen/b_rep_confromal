@@ -8,6 +8,7 @@ import trimesh.proximity
 import trimesh
 import numpy as np
 from GUI_Design import *
+from collections import deque
 
 
 def get_master_slicing_surface(print_model, substrate, padding=5):
@@ -66,78 +67,179 @@ def get_master_slicing_surface(print_model, substrate, padding=5):
     return master_skin, print_model, substrate
 
 
-def get_layer_zero(print_model, substrate, dist_tol=1.0, opposing_threshold=-0.7, padding=15):
+from collections import deque
+import numpy as np
+import trimesh
+
+from collections import deque
+import numpy as np
+import trimesh
+
+def get_layer_zero(
+    print_model,
+    substrate,
+    dist_tol=1.0,
+    opposing_threshold=-0.7,
+    padding=10,
+    envelope_dist_tol=15,
+    smooth_threshold=0.80,
+    max_growth_rings=15,
+):
     """
-    Total Coverage Version: Dynamically expands the yellow ROI box to
-    ensure the entire rotated footprint is captured.
+    Contact-centered substrate patch extraction.
+
+    Goal:
+    - Build a strict contact core from proximity + opposing normals
+    - Expand that core into a larger substrate envelope for later
+      offset/displacement + intersection operations
+
+    Parameters
+    ----------
+    dist_tol : float
+        Strict distance threshold for core seeds.
+    opposing_threshold : float
+        Strict normal opposition threshold for core seeds.
+    padding : float
+        XY padding around print_model bounds for ROI cropping.
+    envelope_dist_tol : float
+        Looser distance limit used only for the expanded envelope.
+        This should usually be larger than dist_tol.
+    smooth_threshold : float
+        Dot product threshold between adjacent substrate face normals
+        during envelope growth.
+    max_growth_rings : int
+        Maximum number of adjacency "rings" grown outward from the seed core.
+        This is a very useful way to control surface padding.
     """
+
     # --- 1. DYNAMIC ROTATED BOUNDS ---
-    # We get the min/max of the model in its CURRENT orientation
     bounds = print_model.bounds
     min_pts, max_pts = bounds[0], bounds[1]
 
-    # Calculate the current width and depth
-    width_x = max_pts[0] - min_pts[0]
-    width_y = max_pts[1] - min_pts[1]
-
-    # The center of the 'shadow' on the XY plane
     center_x = (max_pts[0] + min_pts[0]) / 2.0
     center_y = (max_pts[1] + min_pts[1]) / 2.0
 
-    # Expand by padding
     min_x, max_x = min_pts[0] - padding, max_pts[0] + padding
     min_y, max_y = min_pts[1] - padding, max_pts[1] + padding
 
-    # --- 2. DEBUG ASSET: THE YELLOW BOX ---
-    # We make the box tall enough to enclose the whole model height
+    # --- 2. DEBUG ROI BOX ---
     height_z = max_pts[2] - min_pts[2]
     debug_roi_box = trimesh.creation.box(
         extents=[max_x - min_x, max_y - min_y, height_z + 10],
-        transform=trimesh.transformations.translation_matrix([center_x, center_y, (max_pts[2] + min_pts[2]) / 2.0])
+        transform=trimesh.transformations.translation_matrix(
+            [center_x, center_y, (max_pts[2] + min_pts[2]) / 2.0]
+        )
     )
 
-    # --- 3. THE GUILLOTINE ---
+    # --- 3. CROP THE SUBSTRATE ---
     cropped_sub = substrate.copy()
     planes = [
-        ([min_x, 0, 0], [1, 0, 0]), ([max_x, 0, 0], [-1, 0, 0]),
-        ([0, min_y, 0], [0, 1, 0]), ([0, max_y, 0], [0, -1, 0])                                                         #creating planes along with normals, we can tell which side of plane are we keeping
+        ([min_x, 0, 0], [1, 0, 0]),
+        ([max_x, 0, 0], [-1, 0, 0]),
+        ([0, min_y, 0], [0, 1, 0]),
+        ([0, max_y, 0], [0, -1, 0]),
     ]
+
     for origin, normal in planes:
         cropped_sub = cropped_sub.slice_plane(origin, normal)
 
     cropped_sub.merge_vertices()
 
-    # --- 4. SEED & GROWTH (Same as before but with expanded area) ---
+    if len(cropped_sub.faces) == 0:
+        empty_mesh = trimesh.Trimesh(
+            vertices=np.empty((0, 3)),
+            faces=np.empty((0, 3), dtype=int)
+        )
+        return empty_mesh, debug_roi_box, None
+
+    # --- 4. FACE DATA ---
     face_centers = cropped_sub.triangles_center
-    _, distances, pm_face_ids = trimesh.proximity.closest_point(print_model, face_centers)
     sub_normals = cropped_sub.face_normals
-    pm_normals = print_model.face_normals[pm_face_ids]
-    dot_products = np.sum(sub_normals * pm_normals, axis=1)
+    n_faces = len(cropped_sub.faces)
 
-    seed_indices = np.where((distances <= dist_tol) & (dot_products < opposing_threshold))[0]                           #plane underneath the print model in substrate
+    # --- 5. LOCAL FACE-PAIR MATCHING ---
+    _, distances, pm_face_ids = trimesh.proximity.closest_point(print_model, face_centers)
 
-    # Directional alignment for the 'Green' extension
-    v_nozzle = -print_model.face_normals.mean(axis=0)   #ver
-    v_nozzle /= (np.linalg.norm(v_nozzle) + 1e-8)
-    alignment = np.dot(sub_normals, v_nozzle)
+    valid_pm = (pm_face_ids >= 0) & (pm_face_ids < len(print_model.faces))
 
-    # Take EVERYTHING in the box that faces the nozzle
-    valid_indices = np.where(alignment > 0.05)[0]
+    nearest_model_normals = np.zeros_like(sub_normals)
+    nearest_model_normals[valid_pm] = print_model.face_normals[pm_face_ids[valid_pm]]
 
-    # Combine Seed + ROI
-    final_indices = list(set(seed_indices).union(set(valid_indices)))
-    layer_zero_surface = cropped_sub.submesh([final_indices], append=True)
+    normal_dot = np.einsum('ij,ij->i', sub_normals, nearest_model_normals)
 
-    # Clean up shrapnel
+    # --- 6. STRICT CONTACT CORE ---
+    core_mask = valid_pm & (distances <= dist_tol) & (normal_dot <= opposing_threshold)
+    core_indices = np.where(core_mask)[0]
+
+    # --- 7. BUILD FACE ADJACENCY ---
+    neighbors = [[] for _ in range(n_faces)]
+    for f0, f1 in cropped_sub.face_adjacency:
+        neighbors[f0].append(f1)
+        neighbors[f1].append(f0)
+
+    # --- 8. ENVELOPE GROWTH ---
+    # Important:
+    # Growth is NOT strict contact anymore.
+    # It is just a controlled substrate expansion around the contact core.
+    if len(core_indices) > 0:
+        accepted = set(core_indices.tolist())
+        queue = deque((idx, 0) for idx in core_indices.tolist())  # (face_id, ring_depth)
+
+        while queue:
+            current, depth = queue.popleft()
+
+            if depth >= max_growth_rings:
+                continue
+
+            for nb in neighbors[current]:
+                if nb in accepted:
+                    continue
+
+                if not valid_pm[nb]:
+                    continue
+
+                # Condition 1: stay within a broader model-neighborhood band
+                within_envelope_band = distances[nb] <= envelope_dist_tol
+
+                # Condition 2: remain a smooth continuation on the substrate
+                smooth_enough = np.dot(sub_normals[current], sub_normals[nb]) >= smooth_threshold
+
+                if within_envelope_band and smooth_enough:
+                    accepted.add(nb)
+                    queue.append((nb, depth + 1))
+
+        final_indices = np.array(sorted(accepted), dtype=int)
+    else:
+        final_indices = np.array([], dtype=int)
+
+    print(f"DEBUG: Cropped faces = {len(face_centers)}")
+    print(f"DEBUG: Core count = {len(core_indices)}")
+    print(f"DEBUG: Final envelope count = {len(final_indices)}")
+
+    if len(core_indices) > 0:
+        print(f"DEBUG: Core dist min/max = {distances[core_indices].min():.4f} / {distances[core_indices].max():.4f}")
+        print(f"DEBUG: Core dot min/max  = {normal_dot[core_indices].min():.4f} / {normal_dot[core_indices].max():.4f}")
+
+    # --- 9. BUILD OUTPUT ---
+    if len(final_indices) > 0:
+        layer_zero_surface = cropped_sub.submesh([final_indices], append=True)
+    else:
+        layer_zero_surface = trimesh.Trimesh(
+            vertices=np.empty((0, 3)),
+            faces=np.empty((0, 3), dtype=int)
+        )
+
+    # Cleanup shrapnel
     try:
         components = layer_zero_surface.split(only_watertight=False)
-        layer_zero_surface = max(components, key=lambda m: len(m.faces))
+        if len(components) > 0:
+            layer_zero_surface = max(components, key=lambda m: len(m.faces))
     except:
         pass
 
-    seed_mesh = cropped_sub.submesh([seed_indices], append=True) if len(seed_indices) > 0 else None
+    core_mesh = cropped_sub.submesh([core_indices], append=True) if len(core_indices) > 0 else None
 
-    return layer_zero_surface, debug_roi_box, seed_mesh
+    return layer_zero_surface, debug_roi_box, core_mesh
 
 def generate_offset_surface(base_skin, layer_index, layer_height):
     """
@@ -188,56 +290,302 @@ def offset_layer(skin_mesh, layer_height):
 
     return offset_skin
 
+def extract_model_patch_from_layer_zero(
+    layer_zero_surface,
+    print_model,
+    layer_height,
+    gap_tol=0.10,
+    euclid_tol=None,
+    normal_opp_threshold=-0.35,
+    normal_offset_ratio_threshold = 0.75,
+    vertex_band_ratio=2/3,
+    min_component_faces=20,
+    keep_largest_only=True,
+):
+    """
+    Build a model-side first-layer patch from the substrate-side layer_zero_surface.
 
-def extract_ordered_perimeter(interface_mesh):
-    # If the mesh has no boundary, outline() returns an empty Path3D
+    Improved robust version:
+    - center-based signed-gap test
+    - local normal-opposition test
+    - NEW: vertex support test to reject last side-wall triangles
+
+    Parameters
+    ----------
+    layer_zero_surface : trimesh.Trimesh
+        Substrate-side working patch.
+    print_model : trimesh.Trimesh
+        Full print model mesh.
+    layer_height : float
+        Layer height offset.
+    gap_tol : float
+        Tolerance for signed gap.
+    euclid_tol : float or None
+        Euclidean guard band. If None, auto-chosen.
+    normal_opp_threshold : float
+        Dot threshold between model-face normal and matched substrate-patch normal.
+        Typical:
+            -0.2  loose
+            -0.35 moderate
+            -0.5  strict
+    vertex_band_ratio : float
+        Fraction of triangle vertices that must pass the band test.
+        2/3 is a very good default.
+    """
+    if layer_zero_surface is None or len(layer_zero_surface.faces) == 0:
+        empty = trimesh.Trimesh(
+            vertices=np.empty((0, 3)),
+            faces=np.empty((0, 3), dtype=int)
+        )
+        return empty, {}
+
+    if euclid_tol is None:
+        euclid_tol = layer_height + 2.0 * gap_tol
+
+    lz = layer_zero_surface.copy()
+
+    try:
+        lz.fix_normals()
+    except Exception:
+        pass
+
+    # -------------------------------------------------
+    # A. FACE-CENTER TESTS
+    # -------------------------------------------------
+    pm_face_centers = print_model.triangles_center
+    pm_face_normals = print_model.face_normals
+
+    closest_pts_c, distances_c, lz_face_ids_c = trimesh.proximity.closest_point(lz, pm_face_centers)
+    valid_c = (lz_face_ids_c >= 0) & (lz_face_ids_c < len(lz.faces))
+
+    if not np.any(valid_c):
+        empty = trimesh.Trimesh(
+            vertices=np.empty((0, 3)),
+            faces=np.empty((0, 3), dtype=int)
+        )
+        return empty, {
+            "face_mask": np.zeros(len(print_model.faces), dtype=bool),
+            "signed_gap_center": np.full(len(print_model.faces), np.nan),
+            "distances_center": distances_c,
+            "normal_dot": np.full(len(print_model.faces), np.nan),
+            "normal_offset_ratio": np.full(len(print_model.faces), np.nan),
+        }
+
+    lz_normals_c = np.zeros_like(pm_face_centers)
+    lz_normals_c[valid_c] = lz.face_normals[lz_face_ids_c[valid_c]]
+
+    gap_vec_c = pm_face_centers - closest_pts_c
+    signed_gap_center = np.einsum("ij,ij->i", gap_vec_c, lz_normals_c)
+
+    near_band = valid_c & (distances_c <= (layer_height + 2.0 * gap_tol))
+    if np.any(near_band):
+        if np.mean(signed_gap_center[near_band]) < 0:
+            signed_gap_center = -signed_gap_center
+
+    normal_dot = np.einsum("ij,ij->i", pm_face_normals, lz_normals_c)
+
+    # NEW: require center-to-surface offset to be mostly normal, not tangential
+    normal_offset_ratio = np.abs(signed_gap_center) / (distances_c + 1e-8)
+
+    center_mask = (
+            valid_c
+            & (signed_gap_center >= -gap_tol)
+            & (signed_gap_center <= layer_height + gap_tol)
+            & (distances_c <= euclid_tol)
+            & (normal_dot <= normal_opp_threshold)
+            & (normal_offset_ratio >= normal_offset_ratio_threshold)
+    )
+
+    # -------------------------------------------------
+    # B. VERTEX SUPPORT TEST
+    # -------------------------------------------------
+    # Query all model vertices against layer_zero_surface
+    pm_vertices = print_model.vertices
+    closest_pts_v, distances_v, lz_face_ids_v = trimesh.proximity.closest_point(lz, pm_vertices)
+    valid_v = (lz_face_ids_v >= 0) & (lz_face_ids_v < len(lz.faces))
+
+    lz_normals_v = np.zeros_like(pm_vertices)
+    lz_normals_v[valid_v] = lz.face_normals[lz_face_ids_v[valid_v]]
+
+    gap_vec_v = pm_vertices - closest_pts_v
+    signed_gap_v = np.einsum("ij,ij->i", gap_vec_v, lz_normals_v)
+
+    if np.any(valid_v):
+        if np.nanmean(signed_gap_v[valid_v]) < 0:
+            signed_gap_v = -signed_gap_v
+
+    vertex_good = (
+        valid_v
+        & (signed_gap_v >= -gap_tol)
+        & (signed_gap_v <= layer_height + gap_tol)
+        & (distances_v <= euclid_tol)
+    )
+
+    # For each face, count how many of its 3 vertices pass
+    face_vertex_ids = print_model.faces
+    good_counts = vertex_good[face_vertex_ids].sum(axis=1)
+
+    required_vertex_count = int(np.ceil(3 * vertex_band_ratio))
+    vertex_support_mask = good_counts >= required_vertex_count
+
+    # -------------------------------------------------
+    # C. FINAL FACE MASK
+    # -------------------------------------------------
+    face_mask = center_mask & vertex_support_mask
+
+    face_ids = np.where(face_mask)[0]
+
+    if len(face_ids) == 0:
+        empty = trimesh.Trimesh(
+            vertices=np.empty((0, 3)),
+            faces=np.empty((0, 3), dtype=int)
+        )
+        return empty, {
+            "face_mask": face_mask,
+            "signed_gap_center": signed_gap_center,
+            "distances_center": distances_c,
+            "normal_dot": normal_dot,
+            "vertex_good_counts": good_counts,
+        }
+
+    patch_mesh = print_model.submesh([face_ids], append=True)
+
+    # -------------------------------------------------
+    # D. COMPONENT CLEANUP
+    # -------------------------------------------------
+    try:
+        components = patch_mesh.split(only_watertight=False)
+        components = [c for c in components if len(c.faces) >= min_component_faces]
+
+        if len(components) == 0:
+            patch_mesh = trimesh.Trimesh(
+                vertices=np.empty((0, 3)),
+                faces=np.empty((0, 3), dtype=int)
+            )
+        elif keep_largest_only:
+            patch_mesh = max(components, key=lambda m: len(m.faces))
+        else:
+            patch_mesh = trimesh.util.concatenate(components)
+    except Exception:
+        pass
+
+    debug = {
+        "face_mask": face_mask,
+        "signed_gap_center": signed_gap_center,
+        "distances_center": distances_c,
+        "normal_dot": normal_dot,
+        "vertex_good_counts": good_counts,
+    }
+
+    return patch_mesh, debug
+
+def extract_first_layer_intersection_perimeter(
+    layer_zero_surface,
+    print_model,
+    layer_height,
+    gap_tol=0.10,
+    euclid_tol=None,
+    min_component_faces=20,
+    keep_largest_only=True,
+):
+    """
+    Full helper:
+    1. Build model-side first-layer patch
+    2. Extract ordered perimeter loops from that patch
+    """
+    patch_mesh, debug = extract_model_patch_from_layer_zero(
+        layer_zero_surface=layer_zero_surface,
+        print_model=print_model,
+        layer_height=layer_height,
+        gap_tol=gap_tol,
+        euclid_tol=euclid_tol,
+        min_component_faces=min_component_faces,
+        keep_largest_only=keep_largest_only,
+    )
+
+    if patch_mesh is None or len(patch_mesh.faces) == 0:
+        return patch_mesh, [], debug
+
+    perimeter_loops = extract_ordered_perimeter_5axis(
+        patch_mesh,
+        normal_source_mesh=print_model
+    )
+
+    return patch_mesh, perimeter_loops, debug
+
+def extract_ordered_perimeter_5axis(interface_mesh, normal_source_mesh=None, closed_tol=1e-3):
+    """
+    Extract ordered perimeter loops and corresponding normals.
+
+    Uses path_obj.discrete so each returned path is already an ordered
+    Nx3 array of points instead of a segment array like (N,2,3).
+
+    Parameters
+    ----------
+    interface_mesh : trimesh.Trimesh
+        Patch whose perimeter we want.
+    normal_source_mesh : trimesh.Trimesh or None
+        Mesh from which normals will be sampled. If None, uses interface_mesh.
+    closed_tol : float
+        Distance tolerance to determine whether the path is closed.
+
+    Returns
+    -------
+    results : list of dict
+        Each dict contains:
+        - 'points': (N,3) ordered path points
+        - 'normals': (N,3) sampled normals
+        - 'is_closed': bool
+    """
+    if interface_mesh is None or len(interface_mesh.faces) == 0:
+        return []
+
     path_obj = interface_mesh.outline()
-    segments = path_obj.discrete
 
-    if not segments or len(segments) == 0:
-        print("DEBUG: No discrete segments found in outline.")
-        return []  # Return empty list, not None
+    if path_obj is None:
+        return []
+
+    discrete_paths = path_obj.discrete
+    if discrete_paths is None or len(discrete_paths) == 0:
+        return []
+
+    if normal_source_mesh is None:
+        normal_source_mesh = interface_mesh
 
     results = []
-    from trimesh.proximity import closest_point
 
-    for seg in segments:
-        _, _, face_indices = closest_point(interface_mesh, seg)
-        path_normals = interface_mesh.face_normals[face_indices]
+    for pts in discrete_paths:
+        pts = np.asarray(pts)
+
+        # Make sure shape is (N,3)
+        if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 2:
+            continue
+
+        # Sample normals from nearest vertices on the source mesh
+        _, vertex_indices = normal_source_mesh.kdtree.query(pts)
+        normals = normal_source_mesh.vertex_normals[vertex_indices]
+
+        # Detect closed loop
+        is_closed = np.linalg.norm(pts[0] - pts[-1]) <= closed_tol
 
         results.append({
-            'points': seg,
-            'normals': path_normals
+            'points': pts,
+            'normals': normals,
+            'is_closed': is_closed
         })
-    print(results)
+
     return results
 
 
-def extract_ordered_perimeter(interface_mesh):
-    if interface_mesh is None or len(interface_mesh.faces) == 0:
-        return None, None
-
-    path_obj = interface_mesh.outline()
-    segments = path_obj.discrete
-    if not segments: return None, None
-
-    path_points = max(segments, key=len)
-
-    # USE THE MODULE CALL HERE TOO
-    from trimesh.proximity import closest_point
-    _, _, face_indices = closest_point(interface_mesh, path_points)
-    path_normals = interface_mesh.face_normals[face_indices]
-
-    return path_points, path_normals
 
 
 def main():
     # ---------------------------------------------------------
     # A. Load your files (Initial state)
     # ---------------------------------------------------------
-    base_dir = r"C:\Users\bb237\PycharmProjects\b_repp_offsetting\stl_files\ring"
-    model_file = os.path.join(base_dir, r'cylinder_ring - ring_55mm_dia-1.stl')
-    substrate_file = os.path.join(base_dir, r"cylinder_ring - 50_mm_dia-1.stl")
+    base_dir = r"C:\Users\bb237\PycharmProjects\b_repp_offsetting\stl_files\c"
+    model_file = os.path.join(base_dir, r'UA - Part4^UA-1.stl')
+    substrate_file = os.path.join(base_dir, r"UA - kickoff-1 10cm_dia_substrate_updated v3.step-1.stl")
 
     print("[1/4] Loading meshes from disk...")
     mesh_in = trimesh.load_mesh(model_file)
@@ -247,36 +595,77 @@ def main():
     # B. Orientation & Manual Positioning
     # ---------------------------------------------------------
     print("[2/4] Launching Orientation GUI...")
-    # This returns the already-rotated Trimesh objects
     rotated_model, rotated_substrate, final_angles = get_user_orientation_gui(mesh_in, sub_in)
 
     print(f"\n[3/4] Orientation Locked at Euler Angles: {final_angles}")
 
     # ---------------------------------------------------------
-    # C. Geometric Extraction (The Cookie Cutter)
+    # C. Extract layer-zero / substrate envelope
     # ---------------------------------------------------------
-    # We call the cropping function on the ROTATED data
-    master_skin = get_master_slicing_surface(rotated_model, rotated_substrate, padding=5)
+    print("[4/4] Extracting layer-zero surface...")
+    master_skin, roi_box, core_mesh = get_layer_zero(rotated_model, rotated_substrate)
 
-    if master_skin is not None:
-        print("[4/4] Initializing Dual Contouring Slicing Engine...")
+    # ---------------------------------------------------------
+    # D. Visualize result
+    # ---------------------------------------------------------
+    p = pv.Plotter()
+    p.set_background("white")
 
-        # --- VISUAL VALIDATION BEFORE SLICING ---
-        # This confirms everything is ready for your 5-axis layers
-        p = pv.Plotter()
-        p.add_mesh(rotated_model, color='#3070B3', label='Target Model', opacity=0.6)
-        p.add_mesh(master_skin, color='green', label='Master Slicing Surface (Layer 0)')
-        p.add_legend()
-        p.show(title="Final Validation: Pre-Slicing Check")
+    # rotated model
+    if rotated_model is not None and len(rotated_model.faces) > 0:
+        p.add_mesh(
+            pv.wrap(rotated_model),
+            color="#3070B3",
+            opacity=0.5,
+            show_edges=True,
+            edge_color="black",
+            label="Rotated Print Model"
+        )
 
-        # ---------------------------------------------------------
-        # TRIGGER YOUR DUAL CONTOURING HERE
-        # ---------------------------------------------------------
-        # layers = your_slicer.generate_conformal_layers(base_surface=master_skin, target=rotated_model)
+    # rotated substrate
+    if rotated_substrate is not None and len(rotated_substrate.faces) > 0:
+        p.add_mesh(
+            pv.wrap(rotated_substrate),
+            color="lightgray",
+            opacity=0.2,
+            show_edges=True,
+            edge_color="gray",
+            label="Rotated Substrate"
+        )
 
-        print("\nSlicing Complete. Exporting G-Code...")
-    else:
-        print("[CRITICAL ERROR] Master skin could not be generated. Aborting.")
+    # green envelope surface
+    if master_skin is not None and len(master_skin.faces) > 0:
+        p.add_mesh(
+            pv.wrap(master_skin),
+            color="green",
+            opacity=0.8,
+            show_edges=True,
+            edge_color="darkgreen",
+            label="Master Slicing Surface (Layer 0)"
+        )
+
+    # red core/contact zone
+    if core_mesh is not None and len(core_mesh.faces) > 0:
+        p.add_mesh(
+            pv.wrap(core_mesh),
+            color="red",
+            opacity=1.0,
+            label="Contact Core"
+        )
+
+    # ROI box
+    if roi_box is not None and len(roi_box.faces) > 0:
+        p.add_mesh(
+            pv.wrap(roi_box),
+            color="black",
+            style="wireframe",
+            opacity=0.3,
+            label="ROI Box"
+        )
+
+    p.add_legend()
+    p.show_grid()
+    p.show()
 
     # 3. Now that the parts are locked in, run your Broad/Narrow-phase extraction!
     #layer_zero, print_model, substrate = get_layer_zero(print_model_path, substrate_path)
