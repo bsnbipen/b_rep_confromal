@@ -80,8 +80,8 @@ def get_layer_zero(
     substrate,
     dist_tol=1.0,
     opposing_threshold=-0.7,
-    padding=10,
-    envelope_dist_tol=15,
+    padding=5,
+    envelope_dist_tol=10,
     smooth_threshold=0.80,
     max_growth_rings=15,
 ):
@@ -93,12 +93,13 @@ def get_layer_zero(
     - Expand that core into a larger substrate envelope for later
       offset/displacement + intersection operations
 
+    For a normal comparison (dot product): -1 opposite, 0: perpendicular, 1: parallel
     Parameters
     ----------
     dist_tol : float
         Strict distance threshold for core seeds.
     opposing_threshold : float
-        Strict normal opposition threshold for core seeds.
+        Strict normal opposition threshold for core seeds. (Ideal Case opposite in direction)
     padding : float
         XY padding around print_model bounds for ROI cropping.
     envelope_dist_tol : float
@@ -106,7 +107,7 @@ def get_layer_zero(
         This should usually be larger than dist_tol.
     smooth_threshold : float
         Dot product threshold between adjacent substrate face normals
-        during envelope growth.
+        during envelope growth (Ideal Case same direction).
     max_growth_rings : int
         Maximum number of adjacency "rings" grown outward from the seed core.
         This is a very useful way to control surface padding.
