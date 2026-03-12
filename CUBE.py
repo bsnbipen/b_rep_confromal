@@ -185,7 +185,7 @@ class Cube:
             _normal_points = None
 
         self.sign_change_edges = np.array(_sign_change_edges, dtype=int) if _sign_change_edges else None
-        self._intersection_points = np.array(_intersection_points, dtype=float) if _intersection_points else None
+        self._intersection_points = np.array(_intersection_points, dtype=float) if len(_intersection_points) > 0 else None
         self.intersection_normals = np.array(_normal_points, dtype=float) if _normal_points is not None else None
 
         return self._intersection_points, self.intersection_normals
