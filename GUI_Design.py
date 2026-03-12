@@ -35,6 +35,8 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         'show_model_right': True,
         'show_core_right': True,
         'show_normals_view3': True,
+        'show_skin_view3': True,  # green layer 0 surface
+        'show_patch_view3': True,  # blue patch surface
     }
 
     # Computed geometry assets
@@ -223,41 +225,73 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         # =====================================================
         p.subplot(1, 0)
 
-        # Clear old normals actor if needed
-        try:
-            p.remove_actor('skin_normals_iso', render=False)
-        except Exception:
-            pass
+        # Clear old dynamic actors first
+        for actor_name in ['skin_iso', 'patch_iso', 'txt_iso', 'skin_normals_iso']:
+            try:
+                p.remove_actor(actor_name, render=False)
+            except Exception:
+                pass
 
-        if slice_assets['skin_pv'] is not None and slice_assets['skin_tm'] is not None:
+        has_any_view3 = False
+
+        # --- Layer 0 surface (green) ---
+        if (
+                slice_assets['skin_pv'] is not None
+                and slice_assets['skin_tm'] is not None
+                and ui_settings.get('show_skin_view3', True)
+        ):
             p.add_mesh(
                 slice_assets['skin_pv'],
                 color='#2ECC71',
                 name='skin_iso',
                 show_edges=True,
-                edge_color='darkgreen'
+                edge_color='darkgreen',
+                opacity=0.75
             )
+            has_any_view3 = True
+
+        # --- Model-side patch surface (blue) ---
+        if (
+                slice_assets['patch_pv'] is not None
+                and ui_settings.get('show_patch_view3', True)
+        ):
+            p.add_mesh(
+                slice_assets['patch_pv'],
+                color='#3498DB',
+                name='patch_iso',
+                show_edges=True,
+                edge_color='navy',
+                opacity=0.55
+            )
+            has_any_view3 = True
+
+        if has_any_view3:
             p.add_text(
-                "3. Surface Detail", font_size=10, color='darkgreen',
-                position='upper_left', name='txt_iso'
+                "3. Layer 0 Surface + First-Layer Patch",
+                font_size=10,
+                color='darkgreen',
+                position='upper_left',
+                name='txt_iso'
             )
 
-            if ui_settings.get('show_normals_view3', True):
+            # --- Normals for layer 0 surface only ---
+            if (
+                    ui_settings.get('show_normals_view3', True)
+                    and slice_assets['skin_tm'] is not None
+                    and ui_settings.get('show_skin_view3', True)
+            ):
                 skin_tm = slice_assets['skin_tm']
 
-                # Triangle centers and face normals
                 centers = skin_tm.triangles_center
                 normals = skin_tm.face_normals
 
-                # Build a PyVista point cloud at triangle centers
                 normals_pd = pv.PolyData(centers)
                 normals_pd["normals"] = normals
 
-                # Create arrow glyphs
                 arrows = normals_pd.glyph(
                     orient="normals",
                     scale=False,
-                    factor=2.0  # adjust this size as needed
+                    factor=2.0
                 )
 
                 p.add_mesh(
@@ -270,6 +304,10 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         else:
             try:
                 p.remove_actor('skin_iso', render=False)
+            except Exception:
+                pass
+            try:
+                p.remove_actor('patch_iso', render=False)
             except Exception:
                 pass
             try:
@@ -423,6 +461,34 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         command=toggle_normals_view3
     ).pack(side='left', padx=10)
 
+    skin_view3_var = tk.BooleanVar(value=True)
+    patch_view3_var = tk.BooleanVar(value=True)
+
+    def toggle_skin_view3():
+        ui_settings['show_skin_view3'] = skin_view3_var.get()
+        update_3d_view()
+
+    def toggle_patch_view3():
+        ui_settings['show_patch_view3'] = patch_view3_var.get()
+        update_3d_view()
+
+    skin_v3_f = ttk.Frame(frame)
+    skin_v3_f.pack(fill='x')
+    ttk.Checkbutton(
+        skin_v3_f,
+        text="Show Green Surface (View 3)",
+        variable=skin_view3_var,
+        command=toggle_skin_view3
+    ).pack(side='left', padx=10)
+
+    patch_v3_f = ttk.Frame(frame)
+    patch_v3_f.pack(fill='x')
+    ttk.Checkbutton(
+        patch_v3_f,
+        text="Show Blue Patch (View 3)",
+        variable=patch_view3_var,
+        command=toggle_patch_view3
+    ).pack(side='left', padx=10)
 
     def toggle_model():
         ui_settings['show_model_right'] = model_var.get()
