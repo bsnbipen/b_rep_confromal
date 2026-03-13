@@ -544,17 +544,83 @@ def extract_first_layer_intersection_perimeter(
 
     perimeter_loops = extract_ordered_perimeter_5axis(
         patch_mesh,
-        normal_source_mesh=print_model
+        normal_source_mesh=patch_mesh,
     )
 
     return patch_mesh, perimeter_loops, debug
 
+def sample_barycentric_normals_on_mesh(mesh, query_points):
+    """
+    Sample smooth normals on a mesh by:
+    1. finding the nearest face to each query point
+    2. taking the closest point on that face
+    3. computing barycentric coordinates on that triangle
+    4. interpolating the triangle's vertex normals
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Source mesh for normals.
+    query_points : (N,3) array
+        Points where normals are needed.
+
+    Returns
+    -------
+    normals : (N,3) array
+        Interpolated normals at query points.
+    valid : (N,) bool array
+        Whether each query point got a valid face match.
+    """
+    query_points = np.asarray(query_points, dtype=float)
+
+    if mesh is None or len(mesh.faces) == 0 or len(query_points) == 0:
+        return np.zeros_like(query_points), np.zeros(len(query_points), dtype=bool)
+
+    # Nearest point on mesh + nearest face id
+    closest_pts, distances, face_ids = trimesh.proximity.closest_point(mesh, query_points)
+
+    valid = (face_ids >= 0) & (face_ids < len(mesh.faces))
+    normals = np.zeros_like(query_points, dtype=float)
+
+    if not np.any(valid):
+        return normals, valid
+
+    # Matched triangles
+    tri_faces = mesh.faces[face_ids[valid]]              # (M,3) vertex indices
+    tri_vertices = mesh.vertices[tri_faces]              # (M,3,3)
+
+    # Vertex normals of the matched triangles
+    vnormals = mesh.vertex_normals[tri_faces]            # (M,3,3)
+
+    # Barycentric coordinates of closest_pts inside tri_vertices
+    bary = trimesh.triangles.points_to_barycentric(
+        tri_vertices,
+        closest_pts[valid]
+    )                                                    # (M,3)
+
+    # Interpolate normals
+    interp = (
+        bary[:, [0]] * vnormals[:, 0, :] +
+        bary[:, [1]] * vnormals[:, 1, :] +
+        bary[:, [2]] * vnormals[:, 2, :]
+    )
+
+    # Normalize
+    L = np.linalg.norm(interp, axis=1, keepdims=True)
+    good = L.squeeze() > 1e-12
+    interp[good] = interp[good] / L[good]
+
+    normals[valid] = interp
+    return normals, valid
 def extract_ordered_perimeter_5axis(interface_mesh, normal_source_mesh=None, closed_tol=1e-3):
     """
     Extract ordered perimeter loops and corresponding normals.
 
     Uses path_obj.discrete so each returned path is already an ordered
     Nx3 array of points instead of a segment array like (N,2,3).
+
+    Normals are sampled using nearest-face barycentric interpolation
+    on normal_source_mesh.
 
     Parameters
     ----------
@@ -585,23 +651,35 @@ def extract_ordered_perimeter_5axis(interface_mesh, normal_source_mesh=None, clo
     if discrete_paths is None or len(discrete_paths) == 0:
         return []
 
-
-    #normal inheritance if normal_source_mesh is None, then we use interface mesh normal
     if normal_source_mesh is None:
         normal_source_mesh = interface_mesh
 
     results = []
 
     for pts in discrete_paths:
-        pts = np.asarray(pts)
+        pts = np.asarray(pts, dtype=float)
 
         # Make sure shape is (N,3)
         if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 2:
             continue
 
-        # Sample normals from nearest vertices on the source mesh
-        _, vertex_indices = normal_source_mesh.kdtree.query(pts)
-        normals = normal_source_mesh.vertex_normals[vertex_indices]
+        # Barycentric normal sampling
+        normals, valid = sample_barycentric_normals_on_mesh(normal_source_mesh, pts)
+
+        # Fallback if some points fail
+        if not np.all(valid):
+            # fallback to nearest-vertex normals for failed points only
+            try:
+                _, vertex_indices = normal_source_mesh.kdtree.query(pts[~valid])
+                fallback_normals = normal_source_mesh.vertex_normals[vertex_indices]
+
+                L = np.linalg.norm(fallback_normals, axis=1, keepdims=True)
+                good = L.squeeze() > 1e-12
+                fallback_normals[good] = fallback_normals[good] / L[good]
+
+                normals[~valid] = fallback_normals
+            except Exception:
+                pass
 
         # Detect closed loop
         is_closed = np.linalg.norm(pts[0] - pts[-1]) <= closed_tol
@@ -621,9 +699,9 @@ def main():
     # ---------------------------------------------------------
     # A. Load your files (Initial state)
     # ---------------------------------------------------------
-    base_dir = r"C:\Users\bb237\PycharmProjects\b_repp_offsetting\stl_files\ring"
-    model_file = os.path.join(base_dir, r'cylinder_ring - ring_55mm_dia-1.stl')
-    substrate_file = os.path.join(base_dir, r"cylinder_ring - 50_mm_dia-1.stl")
+    base_dir = r"/Users/bipendrabasnet/PycharmProjects/b_rep_confromal/stl_files/confromal"
+    model_file = os.path.join(base_dir, r'Assem1 - Part3-1.stl')
+    substrate_file = os.path.join(base_dir, r"Assem1 - year_3_3_cm_radius v1.stl")
 
     print("[1/4] Loading meshes from disk...")
     mesh_in = trimesh.load_mesh(model_file)
