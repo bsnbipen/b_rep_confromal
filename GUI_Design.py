@@ -7,6 +7,8 @@ import trimesh.transformations as tf
 import threading
 from trimesh.proximity import closest_point
 from scratch import *
+from intersection_patch import *
+from outline import *
 
 def ensure_trimesh(obj):
     if isinstance(obj, str):
@@ -35,8 +37,9 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         'show_model_right': True,
         'show_core_right': True,
         'show_normals_view3': True,
-        'show_skin_view3': True,  # green layer 0 surface
-        'show_patch_view3': True,  # blue patch surface
+        'show_skin_view3': True,
+        'show_patch_view3': True,
+        'show_inward_view4': True,
     }
 
     # Computed geometry assets
@@ -99,6 +102,10 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         tm_pm, tm_sub = get_rotated_trimeshes()
         layer_h = float(layer_height_var.get())
 
+        perimeter_loops = []
+        debug = None
+        patch_mesh = None
+
         # 1. Get substrate-side working surface
         skin, roi_box, core_mesh = get_layer_zero(tm_pm, tm_sub)
 
@@ -106,15 +113,17 @@ def get_user_orientation_gui(print_model_in, substrate_in):
             slice_assets["skin_tm"] = skin
             slice_assets["skin_pv"] = pv.wrap(skin)
 
-            # 2. Get model-side first-layer patch + perimeter
-            patch_mesh, perimeter_loops, debug = extract_first_layer_intersection_perimeter(
+            patch_mesh, perimeter_loops, debug = build_patch_perimeter_toolpaths(
                 layer_zero_surface=skin,
                 print_model=tm_pm,
                 layer_height=layer_h,
+                n_perimeters=int(num_perimeters_var.get()),
+                perimeter_spacing=float(perimeter_spacing_var.get()),
                 gap_tol=0.10,
                 euclid_tol=layer_h + 0.25,
                 min_component_faces=20,
                 keep_largest_only=True,
+                point_spacing=max(0.25, float(perimeter_spacing_var.get()) / 2.0),
             )
 
             if patch_mesh is not None and len(patch_mesh.faces) > 0:
@@ -130,6 +139,11 @@ def get_user_orientation_gui(print_model_in, substrate_in):
 
         if roi_box is not None and len(roi_box.faces) > 0:
             slice_assets["roi_pv"] = pv.wrap(roi_box)
+
+        print("Requested perimeters:", int(num_perimeters_var.get()))
+        print("Returned perimeter loops:", len(perimeter_loops))
+        for k, pd in enumerate(perimeter_loops):
+            print("loop", k, "ring_id =", pd.get("ring_id", None), "npts =", len(pd["points"]))
 
         update_3d_view()
 
@@ -319,7 +333,7 @@ def get_user_orientation_gui(print_model_in, substrate_in):
             except Exception:
                 pass
         # =====================================================
-        # VIEW 4: BOTTOM-RIGHT (First-Layer Perimeter / Toolpath)
+        # VIEW 4: BOTTOM-RIGHT (Perimeter Toolpaths)
         # =====================================================
         p.subplot(1, 1)
 
@@ -330,57 +344,118 @@ def get_user_orientation_gui(print_model_in, substrate_in):
             except Exception:
                 pass
 
-        for i in range(100):
-            for prefix in ['perim_pts_', 'perim_norms_']:
+        for i in range(300):
+            for prefix in ['perim_pts_', 'perim_norms_', 'perim_start_']:
+
                 try:
                     p.remove_actor(f'{prefix}{i}', render=False)
                 except Exception:
                     pass
 
         p.add_text(
-            "4. First-Layer Perimeter", font_size=10, color='gray',
-            position='upper_left', name='txt_v4_title'
+            "4. Perimeter Toolpaths",
+            font_size=10,
+            color='gray',
+            position='upper_left',
+            name='txt_v4_title'
         )
 
         if slice_assets['skin_pv'] is not None:
             p.add_mesh(
-                slice_assets['skin_pv'], color='#2ECC71', name='v4_skin',
-                opacity=0.20, show_edges=True, edge_color='darkgreen',
+                slice_assets['skin_pv'],
+                color='#2ECC71',
+                name='v4_skin',
+                opacity=0.20,
+                show_edges=True,
+                edge_color='darkgreen',
                 reset_camera=False
             )
 
         if slice_assets['patch_pv'] is not None:
             p.add_mesh(
-                slice_assets['patch_pv'], color='#3498DB', name='v4_patch',
-                opacity=0.40, show_edges=True, edge_color='navy',
+                slice_assets['patch_pv'],
+                color='#3498DB',
+                name='v4_patch',
+                opacity=0.40,
+                show_edges=True,
+                edge_color='navy',
                 reset_camera=False
             )
 
             path_data_list = slice_assets.get('perimeter_loops', [])
+            print("Number of perimeter loops in View 4:", len(path_data_list))
 
             if path_data_list:
                 total_len = 0.0
 
+                ring_colors = [
+                    'yellow',  # outermost
+                    'orange',
+                    'lime',
+                    'cyan',
+                    'magenta',
+                    'white',
+                ]
+
                 for i, path_data in enumerate(path_data_list):
                     pts = path_data['points']
                     norms = path_data['normals']
+                    tangents = path_data.get('tangents', None)
 
-                    loop_pv = pv.PolyData(pts)
-                    loop_pv.point_data["normals"] = norms
+                    ring_id = int(path_data.get('ring_id', 0))
+                    ring_color = ring_colors[ring_id % len(ring_colors)]
 
-                    # Yellow perimeter points
+                    print(f"GUI loop {i}: ring_id={ring_id}, npts={len(pts)}, has_tangent={tangents is not None}")
+
+
+                    # Build closed polyline
+                    loop_line = make_closed_polyline_pv(pts)
+
+                    # Show perimeter as connected line
                     p.add_mesh(
-                        loop_pv, color='yellow', point_size=10.0,
-                        render_points_as_spheres=True, name=f'perim_pts_{i}',
+                        loop_line,
+                        color=ring_color,
+                        line_width=3,
+                        name=f'perim_pts_{i}',
                         reset_camera=False
                     )
 
-                    # Red nozzle normal arrows
-                    arrows = loop_pv.glyph(orient="normals", scale=False, factor=3.0)
-                    p.add_mesh(
-                        arrows, color='red', name=f'perim_norms_{i}',
-                        reset_camera=False
-                    )
+                    # One blue travel-direction arrow per loop, placed at loop start
+                    if tangents is not None and len(pts) > 2:
+                        start_idx = 0
+                        arrow_origin = np.asarray(pts[start_idx], dtype=float)
+                        arrow_dir = np.asarray(tangents[start_idx], dtype=float)
+
+                        L = np.linalg.norm(arrow_dir)
+                        if L > 1e-12:
+                            arrow_dir = arrow_dir / L
+
+                            # show start point
+                            start_pv = pv.PolyData(np.array([arrow_origin]))
+                            p.add_mesh(
+                                start_pv,
+                                color='blue',
+                                point_size=14,
+                                render_points_as_spheres=True,
+                                name=f'perim_start_{i}',
+                                reset_camera=False
+                            )
+
+                            arrow_pd = pv.PolyData(np.array([arrow_origin]))
+                            arrow_pd["travel_dir"] = np.array([arrow_dir])
+
+                            arrow_glyph = arrow_pd.glyph(
+                                orient="travel_dir",
+                                scale=False,
+                                factor=3.0
+                            )
+
+                            p.add_mesh(
+                                arrow_glyph,
+                                color='blue',
+                                name=f'perim_norms_{i}',
+                                reset_camera=False
+                            )
 
                     if len(pts) > 1:
                         total_len += np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()
@@ -389,18 +464,24 @@ def get_user_orientation_gui(print_model_in, substrate_in):
 
                 p.add_text(
                     f"Total Path: {total_len:.2f} mm",
-                    position='lower_right', font_size=9, name='txt_stats'
+                    position='lower_right',
+                    font_size=9,
+                    name='txt_stats'
                 )
                 p.reset_camera(render=False)
             else:
                 p.add_text(
-                    "No Boundary Found", position='upper_left',
-                    color='orange', name='txt_v4_err'
+                    "No Boundary Found",
+                    position='upper_left',
+                    color='orange',
+                    name='txt_v4_err'
                 )
         else:
             p.add_text(
-                "Generate Slice First", position='upper_left',
-                color='gray', name='txt_v4_err'
+                "Generate Slice First",
+                position='upper_left',
+                color='gray',
+                name='txt_v4_err'
             )
 
         p.render()
@@ -422,6 +503,15 @@ def get_user_orientation_gui(print_model_in, substrate_in):
 
     ttk.Label(frame, text="Layer Height (mm)", font=('Arial', 9)).pack(pady=(5, 2))
     ttk.Entry(frame, textvariable=layer_height_var).pack(fill='x', pady=(0, 8))
+
+    num_perimeters_var = tk.IntVar(value=2)
+    perimeter_spacing_var = tk.DoubleVar(value=0.60)
+
+    ttk.Label(frame, text="Number of Perimeters", font=('Arial', 9)).pack(pady=(5, 2))
+    ttk.Entry(frame, textvariable=num_perimeters_var).pack(fill='x', pady=(0, 8))
+
+    ttk.Label(frame, text="Perimeter Spacing (mm)", font=('Arial', 9)).pack(pady=(5, 2))
+    ttk.Entry(frame, textvariable=perimeter_spacing_var).pack(fill='x', pady=(0, 8))
 
     ttk.Button(frame, text="GENERATE SLICE (CURRENT ORIENT)", command=cmd_generate_slice).pack(fill='x', pady=5)
 
@@ -489,6 +579,47 @@ def get_user_orientation_gui(print_model_in, substrate_in):
         variable=patch_view3_var,
         command=toggle_patch_view3
     ).pack(side='left', padx=10)
+
+    inward_view4_var = tk.BooleanVar(value=True)
+
+    def make_closed_polyline_pv(points):
+        """
+        Build a PyVista PolyData closed polyline from ordered loop points.
+        Assumes points are already ordered around the loop.
+        """
+        pts = np.asarray(points, dtype=float)
+
+        if len(pts) < 2:
+            return pv.PolyData(pts)
+
+        # remove duplicate last point if already closed
+        if np.linalg.norm(pts[0] - pts[-1]) < 1e-9:
+            pts_use = pts[:-1]
+        else:
+            pts_use = pts
+
+        n = len(pts_use)
+        poly = pv.PolyData(pts_use)
+
+        # one closed polyline cell
+        lines = np.hstack([[n + 1], np.arange(n), 0]).astype(np.int64)
+        poly.lines = lines
+        return poly
+
+
+    def toggle_inward_view4():
+        ui_settings['show_inward_view4'] = inward_view4_var.get()
+        update_3d_view()
+
+    inward_v4_f = ttk.Frame(frame)
+    inward_v4_f.pack(fill='x')
+    ttk.Checkbutton(
+        inward_v4_f,
+        text="Show Inward Dir (View 4)",
+        variable=inward_view4_var,
+        command=toggle_inward_view4
+    ).pack(side='left', padx=10)
+
 
     def toggle_model():
         ui_settings['show_model_right'] = model_var.get()
