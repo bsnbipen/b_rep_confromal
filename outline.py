@@ -1092,6 +1092,9 @@ def build_next_perimeter_candidate(
 
 def generate_perimeter_toolpaths_from_patch(
     patch_mesh,
+    V_patch,
+    F_patch,
+    UV_patch,
     seed_loops,
     n_perimeters,
     perimeter_spacing,
@@ -1142,6 +1145,20 @@ def generate_perimeter_toolpaths_from_patch(
             "ring_id": 0,
         }
 
+        # NEW: map seed loop from 3D patch to UV
+        seed_uv, valid_uv, seed_face_ids, seed_closest = map_points_3d_to_uv_on_patch(
+            seed_path["points"],
+            V_patch,
+            F_patch,
+            UV_patch
+        )
+
+        if np.sum(valid_uv) < min_points:
+            print(f"[toolpaths] family_id={family_id} FAIL: seed loop UV mapping invalid")
+            continue
+
+        seed_path["points_uv"] = seed_uv
+
         tangents, inward_dirs, _ = compute_loop_frames(
             seed_path["points"],
             seed_path["normals"],
@@ -1160,17 +1177,16 @@ def generate_perimeter_toolpaths_from_patch(
         for ring_id in range(1, int(n_perimeters)):
             print(f"\n[toolpaths] attempting ring_id={ring_id}")
 
-            nxt = build_next_perimeter_candidate(
+            nxt = build_next_perimeter_candidate_uv(
                 current_path_data=current,
                 patch_mesh=patch_mesh,
-                offset_distance=perimeter_spacing,
-                point_spacing=point_spacing,
-                smooth_iterations=smooth_iterations,
-                smooth_alpha=smooth_alpha,
-                max_proj_dist=max_proj_dist,
-                min_clearance_to_prev=min_clearance_to_prev,
-                min_keep_ratio=min_keep_ratio,
+                V_patch=V_patch,
+                F_patch=F_patch,
+                UV_patch=UV_patch,
+                offset_distance_3d=perimeter_spacing,
+                point_spacing_3d=point_spacing,
                 min_points=min_points,
+                angle_deg_threshold=25.0,
             )
 
             if nxt is None:
@@ -1226,6 +1242,27 @@ def build_patch_perimeter_toolpaths(
         keep_largest_only=keep_largest_only,
     )
 
+    backmap_debug = None
+    if seed_loops is not None and len(seed_loops) > 0:
+        backmap_debug = back_map_seed_loop_on_patch(
+            patch_mesh=patch_mesh,
+            seed_loop=seed_loops[0]
+        )
+
+        # optional UV plot
+        plot_patch_uv(
+            backmap_debug["UV_patch"],
+            np.asarray(patch_mesh.faces, dtype=np.int32),
+            bnd_patch=backmap_debug["bnd_patch"],
+            seed_uv=backmap_debug["seed_uv"],
+            title="Patch UV + Seed Perimeter"
+        )
+
+    if debug is None:
+        debug = {}
+    debug["backmap_debug"] = backmap_debug
+
+
     if patch_mesh is None or len(patch_mesh.faces) == 0:
         print("[build_patch] FAIL: patch mesh empty")
         return patch_mesh, [], debug
@@ -1234,6 +1271,16 @@ def build_patch_perimeter_toolpaths(
     F_patch = np.asarray(patch_mesh.faces, dtype=np.int32)
 
     UV_patch, bnd_patch, bnd_uv = compute_patch_uv_lscm(V_patch, F_patch)
+
+    if seed_loops is not None and len(seed_loops) > 0:
+        uv_debug = debug_seed_uv_mapping(
+            patch_mesh=patch_mesh,
+            seed_loop=seed_loops[0],
+            show_plot=True
+        )
+    else:
+        uv_debug = None
+
     plot_patch_uv(UV_patch, F_patch, bnd_patch=bnd_patch)
 
 
@@ -1245,7 +1292,7 @@ def build_patch_perimeter_toolpaths(
         F_patch,
         UV_patch
     )
-
+    print("-----------------------------------------------")
     print("UV_patch shape:", UV_patch.shape)
     print("Boundary vertices:", len(bnd_patch))
     print("Boundary UV shape:", bnd_uv.shape)
@@ -1272,6 +1319,9 @@ def build_patch_perimeter_toolpaths(
 
     toolpaths = generate_perimeter_toolpaths_from_patch(
         patch_mesh=patch_mesh,
+        V_patch=V_patch,
+        F_patch=F_patch,
+        UV_patch=UV_patch,
         seed_loops=seed_loops,
         n_perimeters=n_perimeters,
         perimeter_spacing=perimeter_spacing,
@@ -1286,3 +1336,78 @@ def build_patch_perimeter_toolpaths(
 
     print(f"[build_patch] FINAL returned loops: {len(toolpaths)}")
     return patch_mesh, toolpaths, debug
+
+
+def back_map_seed_loop_on_patch(patch_mesh, seed_loop):
+    """
+    Map a seed perimeter 3D -> UV -> 3D and measure reconstruction error.
+
+    Parameters
+    ----------
+    patch_mesh : trimesh.Trimesh
+        Patch mesh used for UV parameterization.
+    seed_loop : dict
+        One perimeter loop dict with key "points".
+
+    Returns
+    -------
+    result : dict
+        {
+            "UV_patch": ...,
+            "bnd_patch": ...,
+            "bnd_uv": ...,
+            "seed_uv": ...,
+            "seed_back_3d": ...,
+            "valid_uv": ...,
+            "valid_back": ...,
+            "error": ...
+        }
+    """
+    V_patch = np.asarray(patch_mesh.vertices, dtype=float)
+    F_patch = np.asarray(patch_mesh.faces, dtype=np.int32)
+
+    # Patch UVs
+    UV_patch, bnd_patch, bnd_uv = compute_patch_uv_lscm(V_patch, F_patch)
+
+
+
+    # Original 3D seed points
+    seed_pts_3d = np.asarray(seed_loop["points"], dtype=float)
+
+    # 3D -> UV
+    seed_uv, valid_uv, seed_face_ids, seed_closest = map_points_3d_to_uv_on_patch(
+        seed_pts_3d,
+        V_patch,
+        F_patch,
+        UV_patch
+    )
+
+    # UV -> 3D
+    seed_back_3d, valid_back, back_face_ids = map_points_uv_to_3d_on_patch(
+        seed_uv,
+        V_patch,
+        F_patch,
+        UV_patch
+    )
+
+    # Euclidean reconstruction error
+    error = np.linalg.norm(seed_back_3d - seed_pts_3d, axis=1)
+
+    print("\n[BACK-MAP DEBUG] =====================")
+    print("seed points         :", len(seed_pts_3d))
+    print("valid 3D->UV        :", np.sum(valid_uv), "/", len(valid_uv))
+    print("valid UV->3D        :", np.sum(valid_back), "/", len(valid_back))
+    print("error min           :", float(np.min(error)))
+    print("error max           :", float(np.max(error)))
+    print("error mean          :", float(np.mean(error)))
+
+    return {
+        "UV_patch": UV_patch,
+        "bnd_patch": bnd_patch,
+        "bnd_uv": bnd_uv,
+        "seed_uv": seed_uv,
+        "seed_back_3d": seed_back_3d,
+        "valid_uv": valid_uv,
+        "valid_back": valid_back,
+        "error": error,
+    }
