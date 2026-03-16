@@ -745,6 +745,7 @@ def build_next_perimeter_candidate_uv(
 
     # join_style=2 -> miter corners
     inner = poly.buffer(-offset_distance_uv, join_style=2)
+    next_uv_raw = np.asarray(inner.exterior.coords, dtype=float)
 
     if inner.is_empty:
         print("[UV OFFSET] FAIL: inward UV offset produced empty polygon")
@@ -766,8 +767,8 @@ def build_next_perimeter_candidate_uv(
     # -----------------------------------------
     # C. Resample in UV while preserving corners
     # -----------------------------------------
-    next_uv = resample_polyline_uniform_nd(
-        next_uv,
+    next_uv_resampled = resample_polyline_uniform_nd(
+        next_uv_raw,
         spacing=point_spacing_uv,
         closed=True,
         preserve_corners=True,
@@ -832,5 +833,11 @@ def build_next_perimeter_candidate_uv(
         "tangents": tangents_next,
         "inward_dirs": inward_next,
         "is_closed": True,
+
+        # debug
+        "current_uv": pts_uv,
+        "next_uv_raw": next_uv_raw,
+        "next_uv_resampled": next_uv_resampled,
+        "next_pts_3d_raw": next_pts_3d,
     }
 

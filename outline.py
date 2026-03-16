@@ -917,8 +917,8 @@ def build_next_perimeter_candidate(
     patch_mesh,
     offset_distance,
     point_spacing=0.5,
-    smooth_iterations=3,
-    smooth_alpha=0.35,
+    smooth_iterations=0,
+    smooth_alpha=0.0,
     max_proj_dist=None,
     min_clearance_to_prev=None,
     min_keep_ratio=0.75,
@@ -1193,6 +1193,16 @@ def generate_perimeter_toolpaths_from_patch(
                 print(f"[toolpaths] ring_id={ring_id} FAILED")
                 break
 
+            if ring_id == 1:
+                plot_uv_offset_debug(
+                    UV_patch,
+                    F_patch,
+                    bnd_patch=None,
+                    current_uv=nxt["current_uv"],
+                    next_uv_raw=nxt["next_uv_raw"],
+                    next_uv_resampled=nxt["next_uv_resampled"],
+                )
+
             nxt["family_id"] = family_id
             nxt["ring_id"] = ring_id
             toolpaths.append(nxt)
@@ -1411,3 +1421,26 @@ def back_map_seed_loop_on_patch(patch_mesh, seed_loop):
         "valid_back": valid_back,
         "error": error,
     }
+
+def plot_uv_offset_debug(UV_patch, F_patch, bnd_patch, current_uv, next_uv_raw, next_uv_resampled):
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    for tri in F_patch:
+        tri_uv = UV_patch[tri]
+        tri_closed = np.vstack([tri_uv, tri_uv[0]])
+        ax.plot(tri_closed[:, 0], tri_closed[:, 1], color='lightgray', linewidth=0.5)
+
+    if bnd_patch is not None and len(bnd_patch) > 0:
+        bnd_uv = UV_patch[bnd_patch]
+        if np.linalg.norm(bnd_uv[0] - bnd_uv[-1]) > 1e-12:
+            bnd_uv = np.vstack([bnd_uv, bnd_uv[0]])
+        ax.plot(bnd_uv[:, 0], bnd_uv[:, 1], color='red', linewidth=2, label='Patch boundary')
+
+    ax.plot(current_uv[:, 0], current_uv[:, 1], color='blue', linewidth=2, label='Current UV loop')
+    ax.plot(next_uv_raw[:, 0], next_uv_raw[:, 1], color='magenta', linewidth=2, label='Raw UV offset')
+    ax.plot(next_uv_resampled[:, 0], next_uv_resampled[:, 1], color='green', linewidth=2, label='Resampled UV offset')
+
+    ax.set_aspect('equal', adjustable='box')
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    plt.show()
