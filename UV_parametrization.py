@@ -841,3 +841,100 @@ def build_next_perimeter_candidate_uv(
         "next_pts_3d_raw": next_pts_3d,
     }
 
+
+def plot_uv_offset_debug(UV_patch, F_patch, bnd_patch, current_uv, next_uv_raw, next_uv_resampled):
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    for tri in F_patch:
+        tri_uv = UV_patch[tri]
+        tri_closed = np.vstack([tri_uv, tri_uv[0]])
+        ax.plot(tri_closed[:, 0], tri_closed[:, 1], color='lightgray', linewidth=0.5)
+
+    if bnd_patch is not None and len(bnd_patch) > 0:
+        bnd_uv = UV_patch[bnd_patch]
+        if np.linalg.norm(bnd_uv[0] - bnd_uv[-1]) > 1e-12:
+            bnd_uv = np.vstack([bnd_uv, bnd_uv[0]])
+        ax.plot(bnd_uv[:, 0], bnd_uv[:, 1], color='red', linewidth=2, label='Patch boundary')
+
+    ax.plot(current_uv[:, 0], current_uv[:, 1], color='blue', linewidth=2, label='Current UV loop')
+    ax.plot(next_uv_raw[:, 0], next_uv_raw[:, 1], color='magenta', linewidth=2, label='Raw UV offset')
+    ax.plot(next_uv_resampled[:, 0], next_uv_resampled[:, 1], color='green', linewidth=2, label='Resampled UV offset')
+
+    ax.set_aspect('equal', adjustable='box')
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    plt.show()
+
+def back_map_seed_loop_on_patch(patch_mesh, seed_loop):
+    """
+    Map a seed perimeter 3D -> UV -> 3D and measure reconstruction error.
+
+    Parameters
+    ----------
+    patch_mesh : trimesh.Trimesh
+        Patch mesh used for UV parameterization.
+    seed_loop : dict
+        One perimeter loop dict with key "points".
+
+    Returns
+    -------
+    result : dict
+        {
+            "UV_patch": ...,
+            "bnd_patch": ...,
+            "bnd_uv": ...,
+            "seed_uv": ...,
+            "seed_back_3d": ...,
+            "valid_uv": ...,
+            "valid_back": ...,
+            "error": ...
+        }
+    """
+    V_patch = np.asarray(patch_mesh.vertices, dtype=float)
+    F_patch = np.asarray(patch_mesh.faces, dtype=np.int32)
+
+    # Patch UVs
+    UV_patch, bnd_patch, bnd_uv = compute_patch_uv_lscm(V_patch, F_patch)
+
+
+
+    # Original 3D seed points
+    seed_pts_3d = np.asarray(seed_loop["points"], dtype=float)
+
+    # 3D -> UV
+    seed_uv, valid_uv, seed_face_ids, seed_closest = map_points_3d_to_uv_on_patch(
+        seed_pts_3d,
+        V_patch,
+        F_patch,
+        UV_patch
+    )
+
+    # UV -> 3D
+    seed_back_3d, valid_back, back_face_ids = map_points_uv_to_3d_on_patch(
+        seed_uv,
+        V_patch,
+        F_patch,
+        UV_patch
+    )
+
+    # Euclidean reconstruction error
+    error = np.linalg.norm(seed_back_3d - seed_pts_3d, axis=1)
+
+    print("\n[BACK-MAP DEBUG] =====================")
+    print("seed points         :", len(seed_pts_3d))
+    print("valid 3D->UV        :", np.sum(valid_uv), "/", len(valid_uv))
+    print("valid UV->3D        :", np.sum(valid_back), "/", len(valid_back))
+    print("error min           :", float(np.min(error)))
+    print("error max           :", float(np.max(error)))
+    print("error mean          :", float(np.mean(error)))
+
+    return {
+        "UV_patch": UV_patch,
+        "bnd_patch": bnd_patch,
+        "bnd_uv": bnd_uv,
+        "seed_uv": seed_uv,
+        "seed_back_3d": seed_back_3d,
+        "valid_uv": valid_uv,
+        "valid_back": valid_back,
+        "error": error,
+    }

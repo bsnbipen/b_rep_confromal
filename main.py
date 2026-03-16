@@ -662,7 +662,7 @@ class TiltedPlaneFieldEvaluator:
 
         return values, normals, valid
 if __name__ == "__main__":
-    base_dir = r"/Users/bipendrabasnet/PycharmProjects/b_rep_confromal/stl_files/c"
+    base_dir = r"C:\Users\bb237\PycharmProjects\b_repp_offsetting\stl_files\c"
     model_file = os.path.join(base_dir, r"UA - Part4^UA-1.stl")
     substrate_file = os.path.join(base_dir, r"UA - kickoff-1 10cm_dia_substrate_updated v3.step-1.stl")
 
