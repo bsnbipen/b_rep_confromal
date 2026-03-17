@@ -8,52 +8,54 @@ from outline import *
 def _point_to_segment_distances(points, a, b, eps=1e-12):
     """
     Distance from many 3D points to one 3D line segment [a,b].
-
-    Parameters
-    ----------
-    points : (N,3) array
-    a, b   : (3,) arrays
-
-    Returns
-    -------
-    d : (N,) array
-        Euclidean distance from each point to the segment.
+    Robust against degenerate or non-finite segments.
     """
     points = np.asarray(points, dtype=float)
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
+    a = np.asarray(a, dtype=float).reshape(3)
+    b = np.asarray(b, dtype=float).reshape(3)
+
+    # Reject invalid segment endpoints
+    if not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
+        return np.full(len(points), np.inf, dtype=float)
 
     ab = b - a
-    ab2 = np.dot(ab, ab)
+    ab2 = float(np.dot(ab, ab))
 
-    if ab2 < eps:
-        return np.linalg.norm(points - a[None, :], axis=1)
+    # Degenerate segment -> treat as point source
+    if (not np.isfinite(ab2)) or ab2 < eps:
+        diff = points - a[None, :]
+        bad = ~np.all(np.isfinite(diff), axis=1)
+        d = np.linalg.norm(np.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0), axis=1)
+        d[bad] = np.inf
+        return d
 
     ap = points - a[None, :]
-    t = (ap @ ab) / ab2
+
+    # Dot product per point
+    numer = np.einsum("ij,j->i", ap, ab)
+
+    # Guard against non-finite numerators
+    numer = np.where(np.isfinite(numer), numer, np.inf)
+
+    t = numer / ab2
     t = np.clip(t, 0.0, 1.0)
 
     proj = a[None, :] + t[:, None] * ab[None, :]
-    d = np.linalg.norm(points - proj, axis=1)
+    diff = points - proj
+
+    bad = ~np.all(np.isfinite(diff), axis=1)
+    d = np.linalg.norm(np.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0), axis=1)
+    d[bad] = np.inf
     return d
 
-def build_initial_distance_to_seed_segments(seed_loop, patch_mesh):
+def build_initial_distance_to_seed_segments(seed_loop, patch_mesh, dedup_tol=1e-10):
     """
     Build an initial scalar field at patch vertices based on Euclidean
     distance to the seed perimeter segments.
 
-    This is a better approximation than using only discrete source vertices.
-
-    Parameters
-    ----------
-    seed_loop : dict
-        Perimeter dict with key "points" and optional "is_closed".
-    patch_mesh : trimesh.Trimesh
-
-    Returns
-    -------
-    initial_distance : (N,) float array
-        For each patch vertex, minimum Euclidean distance to the seed perimeter.
+    Cleans the seed loop first:
+    - removes non-finite points
+    - removes consecutive duplicates
     """
     if patch_mesh is None or len(patch_mesh.vertices) == 0:
         raise ValueError("patch_mesh is empty")
@@ -67,17 +69,36 @@ def build_initial_distance_to_seed_segments(seed_loop, patch_mesh):
     if len(pts) < 2:
         raise ValueError("seed_loop has too few points")
 
+    # Keep only finite points
+    finite_mask = np.all(np.isfinite(pts), axis=1)
+    pts = pts[finite_mask]
+
+    if len(pts) < 2:
+        raise ValueError("seed_loop has too few finite points")
+
     is_closed = bool(seed_loop.get("is_closed", True))
 
     # Remove duplicate closure point temporarily
-    duplicate_last = is_closed and np.linalg.norm(pts[0] - pts[-1]) < 1e-9
-    if duplicate_last:
-        pts_work = pts[:-1]
-    else:
-        pts_work = pts.copy()
+    if is_closed and np.linalg.norm(pts[0] - pts[-1]) < dedup_tol:
+        pts = pts[:-1]
+
+    if len(pts) < 2:
+        raise ValueError("seed_loop has too few unique points")
+
+    # Remove consecutive duplicates / near-duplicates
+    cleaned = [pts[0]]
+    for p in pts[1:]:
+        if np.linalg.norm(p - cleaned[-1]) > dedup_tol:
+            cleaned.append(p)
+
+    pts_work = np.asarray(cleaned, dtype=float)
+
+    # If closed, also avoid first-last duplicate after cleaning
+    if is_closed and len(pts_work) > 1 and np.linalg.norm(pts_work[0] - pts_work[-1]) < dedup_tol:
+        pts_work = pts_work[:-1]
 
     if len(pts_work) < 2:
-        raise ValueError("seed_loop has too few unique points")
+        raise ValueError("seed_loop collapsed after cleaning")
 
     # Build segment list
     if is_closed:
@@ -89,19 +110,32 @@ def build_initial_distance_to_seed_segments(seed_loop, patch_mesh):
 
     initial_distance = np.full(len(verts), np.inf, dtype=float)
 
+    kept_segments = 0
+    skipped_segments = 0
+
     for a, b in zip(seg_starts, seg_ends):
+        if (not np.all(np.isfinite(a))) or (not np.all(np.isfinite(b))):
+            skipped_segments += 1
+            continue
+
+        if np.linalg.norm(b - a) <= dedup_tol:
+            skipped_segments += 1
+            continue
+
         d = _point_to_segment_distances(verts, a, b)
         initial_distance = np.minimum(initial_distance, d)
+        kept_segments += 1
 
     print("\n[build_initial_distance_to_seed_segments] ===")
     print("patch vertices      :", len(verts))
-    print("seed points         :", len(pts))
-    print("num segments        :", len(seg_starts))
-    print("min init dist       :", float(np.min(initial_distance)))
-    print("max init dist       :", float(np.max(initial_distance)))
+    print("seed points raw     :", len(seed_loop['points']))
+    print("seed points cleaned :", len(pts_work))
+    print("segments kept       :", kept_segments)
+    print("segments skipped    :", skipped_segments)
+    print("min init dist       :", float(np.min(initial_distance[np.isfinite(initial_distance)])))
+    print("max init dist       :", float(np.max(initial_distance[np.isfinite(initial_distance)])))
 
     return initial_distance
-
 
 def _interp_iso_point_on_edge(p0, p1, d0, d1, iso_value, eps=1e-12):
     """

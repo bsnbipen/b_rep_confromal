@@ -1,5 +1,7 @@
 import numpy as np
 import heapq
+import trimesh
+import math
 
 
 def build_patch_graph(patch_mesh):
@@ -116,6 +118,120 @@ def map_seed_loop_to_source_vertices(seed_loop, patch_mesh):
     print("unique source vertices :", len(source_vertex_ids))
 
     return source_vertex_ids
+
+
+def remesh_patch_to_edge_length(
+    patch_mesh,
+    target_edge_length,
+    max_iter=8,
+    max_retry=3,
+    relax_factor=1.5,
+):
+    """
+    Refine a patch mesh so no edge is longer than target_edge_length.
+
+    Uses adaptive retries if trimesh.subdivide_to_size hits max_iter.
+
+    Parameters
+    ----------
+    patch_mesh : trimesh.Trimesh
+    target_edge_length : float
+        Desired maximum mesh edge length.
+    max_iter : int
+        Initial subdivision iteration cap.
+    max_retry : int
+        Number of adaptive retries.
+    relax_factor : float
+        If repeated failures happen, relax target edge length by this factor.
+
+    Returns
+    -------
+    remeshed_patch : trimesh.Trimesh
+    """
+    if patch_mesh is None or len(patch_mesh.vertices) == 0 or len(patch_mesh.faces) == 0:
+        raise ValueError("patch_mesh is empty")
+
+    if target_edge_length is None or target_edge_length <= 0:
+        raise ValueError("target_edge_length must be > 0")
+
+    v = np.asarray(patch_mesh.vertices, dtype=float)
+    f = np.asarray(patch_mesh.faces, dtype=np.int32)
+
+    # measure current max edge
+    edges = np.asarray(patch_mesh.edges_unique, dtype=np.int32)
+    edge_vecs = v[edges[:, 1]] - v[edges[:, 0]]
+    edge_lens = np.linalg.norm(edge_vecs, axis=1)
+
+    current_max_edge = float(np.max(edge_lens))
+    current_mean_edge = float(np.mean(edge_lens))
+
+    print("\n[remesh_patch_to_edge_length] =========")
+    print("input vertices   :", len(v))
+    print("input faces      :", len(f))
+    print("current max edge :", current_max_edge)
+    print("current mean edge:", current_mean_edge)
+    print("target edge len  :", float(target_edge_length))
+
+    # estimated required number of subdivision rounds
+    # each subdivision roughly halves long edges
+    if current_max_edge > target_edge_length:
+        est_iter = int(math.ceil(math.log(current_max_edge / target_edge_length, 2))) + 2
+    else:
+        est_iter = 1
+
+    trial_max_iter = max(max_iter, est_iter)
+    trial_target = float(target_edge_length)
+
+    last_err = None
+
+    for attempt in range(max_retry):
+        print(f"[remesh] attempt={attempt + 1}, target={trial_target:.6f}, max_iter={trial_max_iter}")
+
+        try:
+            v_new, f_new = trimesh.remesh.subdivide_to_size(
+                vertices=v,
+                faces=f,
+                max_edge=trial_target,
+                max_iter=trial_max_iter,
+            )
+
+            remeshed_patch = trimesh.Trimesh(
+                vertices=v_new,
+                faces=f_new,
+                process=True
+            )
+
+            edges_new = np.asarray(remeshed_patch.edges_unique, dtype=np.int32)
+            edge_vecs_new = remeshed_patch.vertices[edges_new[:, 1]] - remeshed_patch.vertices[edges_new[:, 0]]
+            edge_lens_new = np.linalg.norm(edge_vecs_new, axis=1)
+
+            print("output vertices  :", len(remeshed_patch.vertices))
+            print("output faces     :", len(remeshed_patch.faces))
+            print("output max edge  :", float(np.max(edge_lens_new)))
+            print("output mean edge :", float(np.mean(edge_lens_new)))
+
+            return remeshed_patch
+
+        except ValueError as e:
+            last_err = e
+
+            if "max_iter exceeded" not in str(e):
+                raise
+
+            print("[remesh] max_iter exceeded, retrying adaptively...")
+
+            # first increase iteration budget
+            trial_max_iter = int(trial_max_iter * 1.75) + 2
+
+            # after first failure, also relax target slightly
+            if attempt >= 1:
+                trial_target *= relax_factor
+
+    raise ValueError(
+        f"Adaptive remesh failed after {max_retry} attempts. "
+        f"Last target={trial_target}, last max_iter={trial_max_iter}. "
+        f"Original error: {last_err}"
+    )
 
 
 def compute_distance_field_dijkstra(

@@ -3,6 +3,8 @@ import numpy as np
 from intersection_patch import *
 from UV_parametrization import *
 from iso_surface import generate_inner_perimeters_dijkstra
+from perimeter_gen import remesh_patch_to_edge_length
+
 
 def extract_first_layer_intersection_perimeter(
     layer_zero_surface,
@@ -12,6 +14,8 @@ def extract_first_layer_intersection_perimeter(
     euclid_tol=None,
     min_component_faces=20,
     keep_largest_only=True,
+    remesh_target_edge=None,
+    seed_point_spacing=1.0,
 ):
     patch_mesh, debug = extract_model_patch_from_layer_zero(
         layer_zero_surface=layer_zero_surface,
@@ -26,13 +30,22 @@ def extract_first_layer_intersection_perimeter(
     if patch_mesh is None or len(patch_mesh.faces) == 0:
         return patch_mesh, [], debug
 
+    # NEW: refine patch before extracting seed perimeter
+    if remesh_target_edge is not None and remesh_target_edge > 0:
+        patch_mesh = remesh_patch_to_edge_length(
+            patch_mesh,
+            target_edge_length=remesh_target_edge
+        )
+
     seed_loops = extract_ordered_perimeter_5axis(
         interface_mesh=patch_mesh,
         normal_source_mesh=patch_mesh,
-        point_spacing=0.25
+        point_spacing=seed_point_spacing
     )
 
     return patch_mesh, seed_loops, debug
+
+
 
 def resample_polyline_uniform(
     points,
@@ -597,14 +610,16 @@ def build_patch_perimeter_toolpaths(
     print(f"[build_patch] layer_height          : {layer_height}")
 
     patch_mesh, seed_loops, debug = extract_first_layer_intersection_perimeter(
-        layer_zero_surface=layer_zero_surface,
-        print_model=print_model,
-        layer_height=layer_height,
-        gap_tol=gap_tol,
-        euclid_tol=euclid_tol,
-        min_component_faces=min_component_faces,
-        keep_largest_only=keep_largest_only,
-    )
+    layer_zero_surface=layer_zero_surface,
+    print_model=print_model,
+    layer_height=layer_height,
+    gap_tol=gap_tol,
+    euclid_tol=euclid_tol,
+    min_component_faces=min_component_faces,
+    keep_largest_only=keep_largest_only,
+    remesh_target_edge=10,
+    seed_point_spacing=point_spacing if point_spacing is not None else 0.5,
+)
 
     if patch_mesh is None or len(patch_mesh.faces) == 0:
         print("[build_patch] FAIL: patch mesh empty")
